@@ -21,11 +21,19 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
+      - name: Clean stale git state
+        run: |
+          git rebase --abort 2>/dev/null || true
+          git merge --abort 2>/dev/null || true
+          git checkout -f 2>/dev/null || true
+          git clean -ffdx 2>/dev/null || true
+        continue-on-error: true
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: main
-          fetch-depth: 0
+          clean: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
