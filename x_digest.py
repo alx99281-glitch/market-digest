@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-X（Twitter）金融ソーシャルダイジェスト
+金融ソーシャル＆ニュースダイジェスト
 
-X/Twitter・Reddit・StockTwits から金融関連の注目投稿をピックアップし、
-  - 注目の投資商品・投資手法（最大5件、具体的なティッカー付き）
-  - 注目ツイート TOP10（エンゲージメント順、リンク付き）
-を毎朝6時・夕方6時に送信する。
+データソース:
+  - X/Twitter API v2（Bearer Token 設定時）: 金融ツイート上位10件
+  - RSS フィード（常時）: Reuters・Yahoo Finance・CNBC・MarketWatch 等
+を毎朝6時・夕方6時に配信。
 
-TWITTER_BEARER_TOKEN が設定されていれば X の実データを取得。
-未設定の場合は Reddit + StockTwits のみで動作。
+RSS は認証不要で安定取得。Twitter はエンゲージメント順TOP10を表示。
 """
 
 import os
@@ -19,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import feedparser
 import pytz
 import requests
 from groq import Groq
@@ -31,8 +31,77 @@ TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; market-digest-bot/1.0)"}
 
+# ── RSS フィード定義 ───────────────────────────────────────
+RSS_FEEDS = {
+    "Reuters(EN)":     "https://feeds.reuters.com/reuters/businessNews",
+    "CNBC":            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "WSJ Markets":     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "MarketWatch":     "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "Yahoo Finance":   "https://finance.yahoo.com/news/rssindex",
+    "Nikkei(EN)":      "https://www.nikkei.com/rss/rss.aspx?ce=MH",
+    "ロイター(日本語)": "https://jp.reuters.com/rssFeed/businessNews",
+    "NHK経済":         "https://www.nhk.or.jp/rss/news/cat6.xml",
+    "株探":             "https://kabutan.jp/rss/news.xml",
+    "Yahoo Finance JP": "https://finance.yahoo.co.jp/rss/category/market",
+}
+
+FINANCE_KEYWORDS = [
+    "株", "相場", "市場", "円", "ドル", "金利", "債券", "為替", "日銀", "FRB",
+    "経済", "GDP", "インフレ", "物価", "日経", "TOPIX", "指数", "原油", "金価格",
+    "利上げ", "利下げ", "政策金利", "貿易", "関税", "景気", "不動産", "マンション",
+    "REIT", "ETF", "投資", "ファンド", "仮想通貨", "ビットコイン",
+    "stock", "market", "bond", "forex", "currency", "rate", "economy",
+    "inflation", "Fed", "central bank", "equity", "yield", "treasury",
+    "finance", "trade", "tariff", "recession", "oil", "gold", "yen", "dollar",
+    "interest rate", "nasdaq", "s&p", "dow", "bitcoin", "crypto", "real estate",
+    "NVDA", "TSLA", "AAPL", "SPY", "QQQ",
+]
+
 
 # ── データ取得 ────────────────────────────────────────────
+
+def fetch_rss(hours: int = 13) -> list[dict]:
+    """RSS フィードから金融ニュースを取得（認証不要・安定）"""
+    cutoff   = datetime.now(timezone.utc) - timedelta(hours=hours)
+    articles = []
+
+    for source, url in RSS_FEEDS.items():
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            for entry in feed.entries[:25]:
+                pub    = entry.get("published_parsed") or entry.get("updated_parsed")
+                pub_dt = datetime(*pub[:6], tzinfo=timezone.utc) if pub else None
+                if pub_dt and pub_dt < cutoff:
+                    continue
+
+                title   = entry.get("title", "").strip()
+                summary = re.sub(r"<[^>]+>", "", entry.get("summary",
+                          entry.get("description", ""))).strip()
+                link    = entry.get("link", "")
+
+                text     = (title + " " + summary).lower()
+                fin_src  = source in ("Yahoo Finance", "Yahoo Finance JP", "株探",
+                                      "ロイター(日本語)", "WSJ Markets", "Reuters(EN)")
+                has_kw   = any(kw.lower() in text for kw in FINANCE_KEYWORDS)
+
+                if fin_src or has_kw:
+                    articles.append({
+                        "source":  source,
+                        "title":   title,
+                        "summary": summary[:300],
+                        "link":    link,
+                        "date":    pub_dt,
+                    })
+        except Exception as e:
+            print(f"[WARN] RSS {source}: {e}")
+        time.sleep(0.2)
+
+    articles.sort(
+        key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True)
+    print(f"  → RSS {len(articles)} 件")
+    return articles[:40]
+
 
 def fetch_twitter(hours: int = 13) -> list[dict]:
     """X/Twitter API v2 で金融関連ツイートを取得（Bearer Token 必須）"""
@@ -44,10 +113,10 @@ def fetch_twitter(hours: int = 13) -> list[dict]:
              ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     queries = [
-        "(株 OR 日経 OR 為替 OR 金利 OR ETF OR 投資信託 OR 債券 OR 仕組み債"
-        " OR レバレッジ OR 空売り OR 不動産 OR マンション) lang:ja -is:retweet -is:reply",
+        "(株 OR 日経 OR 為替 OR 金利 OR ETF OR 投資信託 OR 債券"
+        " OR 不動産 OR マンション OR レバレッジ) lang:ja -is:retweet -is:reply",
         "(stocks OR investing OR markets OR Fed OR SPX OR Nikkei OR ETF"
-        " OR leverage OR hedge OR bond OR forex OR realestate) lang:en -is:retweet -is:reply",
+        " OR leverage OR bond OR forex OR realestate) lang:en -is:retweet -is:reply",
     ]
 
     tweets = []
@@ -60,13 +129,13 @@ def fetch_twitter(hours: int = 13) -> list[dict]:
                     "query":        query,
                     "max_results":  20,
                     "start_time":   since,
-                    "tweet.fields": "public_metrics,created_at,lang,author_id",
+                    "tweet.fields": "public_metrics,created_at,lang",
                 },
                 timeout=15,
             )
             if resp.status_code == 200:
                 for t in resp.json().get("data", []):
-                    m = t.get("public_metrics", {})
+                    m   = t.get("public_metrics", {})
                     eng = (m.get("like_count", 0)
                            + m.get("retweet_count", 0) * 2
                            + m.get("reply_count", 0))
@@ -88,115 +157,43 @@ def fetch_twitter(hours: int = 13) -> list[dict]:
         time.sleep(1)
 
     tweets.sort(key=lambda x: x["engagement"], reverse=True)
+    print(f"  → Twitter {len(tweets)} 件")
     return tweets[:30]
 
 
-def fetch_reddit(hours: int = 13) -> list[dict]:
-    """Reddit 金融コミュニティのホット投稿を取得（認証不要）"""
-    subreddits = [
-        "investing", "stocks", "wallstreetbets", "finance",
-        "StockMarket", "Economics", "SecurityAnalysis",
-        "JapanFinance", "japan_investing",
-    ]
-    posts = []
-    # www.reddit.com が bot ブロックする場合は old.reddit.com を試みる
-    for base_url in ["https://www.reddit.com", "https://old.reddit.com"]:
-        if posts:
-            break
-        for sub in subreddits:
-            try:
-                resp = requests.get(
-                    f"{base_url}/r/{sub}/hot.json?limit=10",
-                    headers=HEADERS, timeout=10,
-                )
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        for item in data["data"]["children"]:
-                            d = item["data"]
-                            posts.append({
-                                "title":    d["title"],
-                                "score":    d.get("score", 0),
-                                "comments": d.get("num_comments", 0),
-                                "sub":      sub,
-                                "url":      f"https://www.reddit.com{d.get('permalink', '')}",
-                            })
-                    except Exception:
-                        pass  # HTML が返った場合などはスキップ
-                elif resp.status_code == 429:
-                    print(f"[WARN] Reddit rate limit ({base_url})")
-                    break
-            except Exception as e:
-                print(f"[WARN] Reddit r/{sub} ({base_url}): {e}")
-            time.sleep(0.3)
+# ── Groq 要約（投資商品セクション） ────────────────────────
 
-    posts.sort(key=lambda x: x["score"] + x["comments"] * 2, reverse=True)
-    return posts[:30]
-
-
-def fetch_stocktwits() -> list[dict]:
-    """StockTwits トレンドシンボルを取得（認証不要）"""
-    try:
-        resp = requests.get(
-            "https://api.stocktwits.com/api/2/trending/symbols.json",
-            headers=HEADERS, timeout=10,
-        )
-        if resp.status_code == 200:
-            return [
-                {"symbol": s["symbol"], "title": s.get("title", "")}
-                for s in resp.json().get("symbols", [])[:15]
-            ]
-    except Exception as e:
-        print(f"[WARN] StockTwits: {e}")
-    return []
-
-
-# ── Groq 要約（投資商品セクションのみ） ──────────────────────
-
-def summarize_products(tweets: list, reddit: list, stocktwits: list,
-                       time_label: str) -> str:
-    """
-    注目の投資商品・投資手法（最大5件）のみをAIで生成。
-    トピックセクションは廃止し、代わりにTOP10ツイートを直接表示する。
-    """
+def summarize_products(articles: list, tweets: list, time_label: str) -> str:
+    """注目の投資商品・投資手法（最大5件）をAI生成"""
     client = Groq(api_key=GROQ_API_KEY)
 
     body = ""
     if tweets:
-        body += "【X (Twitter) 高エンゲージメント投稿（上位20件）】\n"
-        for i, t in enumerate(tweets[:20], 1):
-            body += f"[{i}] ({t['lang']}) {t['text'][:200]} (eng:{t['engagement']})\n"
+        body += "【X (Twitter) 高エンゲージメント投稿】\n"
+        for i, t in enumerate(tweets[:15], 1):
+            body += f"[tw{i}] ({t['lang']}) {t['text'][:200]}\n"
 
-    if reddit:
-        body += "\n【Reddit 金融コミュニティ 注目投稿（上位20件）】\n"
-        for i, p in enumerate(reddit[:20], 1):
-            body += f"[{i}] r/{p['sub']}: {p['title']} (score:{p['score']})\n"
-
-    if stocktwits:
-        body += "\n【StockTwits トレンドシンボル】\n"
-        body += "  ".join(f"{s['symbol']}({s['title']})" for s in stocktwits) + "\n"
+    if articles:
+        body += "\n【最新金融ニュース（RSS）】\n"
+        for i, a in enumerate(articles[:25], 1):
+            body += f"[{a['source']}] {a['title']}  {a['summary'][:150]}\n"
 
     if not body:
         return ""
 
-    sources_label = "X/Twitter・Reddit・StockTwits" if tweets else "Reddit・StockTwits"
-
-    prompt = f"""あなたは金融ソーシャルメディアのアナリストです。
-以下は{sources_label}から収集した金融関連の投稿データです。
-日本語で「注目の投資商品・投資手法」セクションのみを作成してください。
+    prompt = f"""あなたは金融ソーシャルメディア・ニュースのアナリストです。
+以下の投稿・ニュースデータを分析し、「注目の投資商品・投資手法」セクションのみ
+日本語で作成してください。
 
 【ルール】
-- 日本・米国・欧州など世界中の投稿を対象とする
-- 英語投稿は日本語に翻訳・要約する
-- 注目度・エンゲージメントの高いものを優先する
 - 必ず具体的な商品名・ティッカーシンボルで記載すること
-  （例: NVIDIA(NVDA)、DRAM ETF(SOXQ)、S&P500(SPY)、ドル円(USDJPY)、米10年債、
-       東京都内マンション、米国REIT(VNQ)など）
+  （例: NVIDIA(NVDA)、DRAM ETF(SOXQ)、S&P500(SPY)、ドル円(USDJPY)、
+       米10年債、東京都内マンション、米国REIT(VNQ)など）
 - 対象: 個別株・ETF・投資信託・債券・為替・仕組み商品・仮想通貨・
        コモディティ・不動産（マンション・商業施設・REIT等）・
        レバレッジ・空売りなどの投資手法
-- 言及が少ない場合は件数を減らしてよい（最大5件）
-- 引用番号などは不要。商品名と理由だけ簡潔に
+- 言及が少なければ件数を減らしてよい（最大5件）
+- 引用符号は不要。商品名と注目理由だけ簡潔に
 
 【出力形式（このセクションのみ出力）】
 
@@ -227,76 +224,59 @@ def _escape(text: str) -> str:
                 .replace('"', "&quot;"))
 
 
-def build_top_tweets_html(tweets: list, reddit: list,
-                          stocktwits: list | None = None) -> str:
-    """TOP10ツイート（またはReddit投稿）を直接HTML描画。リンク付き。"""
+def build_top10_html(tweets: list, articles: list) -> str:
+    """TOP10 を直接HTML描画。ツイートがあればツイート、なければRSSニュース。"""
     items_html = ""
 
     if tweets:
+        # ── Twitter モード ──
         section_title = "🔥 注目ツイート TOP10"
-        items = tweets[:10]
-        for i, t in enumerate(items, 1):
+        subtitle      = "エンゲージメント順"
+        for i, t in enumerate(tweets[:10], 1):
             url      = f"https://x.com/i/web/status/{t['id']}"
             text_esc = _escape(t["text"])
-            eng_str  = f"♥{t['likes']:,} RT{t['retweets']:,}"
-            lang_tag = (f"<span style='background:#e3f2fd;color:#1565c0;"
-                        f"border-radius:3px;padding:1px 5px;font-size:10px;"
-                        f"margin-right:6px;'>{t['lang'].upper()}</span>"
-                        if t.get("lang") else "")
+            eng_str  = f"♥{t['likes']:,}&nbsp;&nbsp;RT{t['retweets']:,}"
+            lang_tag = (
+                f"<span style='background:#e3f2fd;color:#1565c0;"
+                f"border-radius:3px;padding:1px 5px;font-size:10px;"
+                f"margin-right:6px;'>{_escape(t['lang'].upper())}</span>"
+            ) if t.get("lang") else ""
             items_html += f"""
     <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
-      <div style="font-size:12px;color:#888;margin-bottom:4px;">
-        {lang_tag}
-        <span style="color:#aaa;">#{i} &nbsp; {eng_str}</span>
+      <div style="font-size:12px;color:#aaa;margin-bottom:4px;">
+        {lang_tag}#{i}&nbsp;&nbsp;{eng_str}
       </div>
       <div style="font-size:13px;line-height:1.6;color:#222;">{text_esc}</div>
-      <div style="margin-top:5px;">
-        <a href="{url}" target="_blank"
-           style="font-size:11px;color:#1976d2;text-decoration:none;">
-          → X (Twitter) で見る ↗
-        </a>
-      </div>
-    </div>"""
-
-    elif reddit:
-        section_title = "🔥 注目 Reddit投稿 TOP10"
-        items = reddit[:10]
-        for i, p in enumerate(items, 1):
-            title_esc = _escape(p["title"])
-            url       = p.get("url", "")
-            score_str = f"▲{p['score']:,} 💬{p['comments']:,}"
-            items_html += f"""
-    <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
-      <div style="font-size:12px;color:#888;margin-bottom:4px;">
-        <span style="background:#fff3e0;color:#e65100;border-radius:3px;
-                     padding:1px 5px;font-size:10px;margin-right:6px;">
-          r/{p['sub']}
-        </span>
-        <span style="color:#aaa;">#{i} &nbsp; {score_str}</span>
-      </div>
-      <div style="font-size:13px;line-height:1.6;color:#222;">{title_esc}</div>
-      {"<div style='margin-top:5px;'><a href='" + url + "' target='_blank' style='font-size:11px;color:#1976d2;text-decoration:none;'>→ Reddit で見る ↗</a></div>" if url else ""}
-    </div>"""
-    elif stocktwits:
-        # Twitter・Reddit 両方取得不可の場合は StockTwits トレンドシンボルを表示
-        section_title = "📊 StockTwits トレンドシンボル"
-        for i, s in enumerate(stocktwits[:15], 1):
-            sym   = _escape(s["symbol"])
-            title = _escape(s.get("title", ""))
-            url   = f"https://stocktwits.com/symbol/{s['symbol']}"
-            items_html += f"""
-    <div style="display:inline-block;margin:4px;">
       <a href="{url}" target="_blank"
-         style="background:#e8f5e9;color:#2e7d32;padding:5px 10px;
-                border-radius:4px;text-decoration:none;font-size:12px;
-                font-weight:bold;">
-        {sym}
-        {"<span style='font-weight:normal;font-size:11px;color:#555;'>&nbsp;{}</span>".format(title) if title else ""}
+         style="font-size:11px;color:#1976d2;text-decoration:none;">
+        → X (Twitter) で見る ↗
       </a>
     </div>"""
-        return f"""
-  <h3 style="color:#b71c1c;margin:20px 0 8px;font-size:15px;">{section_title}</h3>
-  <div style="line-height:2.2;">{items_html}</div>"""
+
+    elif articles:
+        # ── RSS ニュースモード ──
+        section_title = "📰 注目金融ニュース TOP10"
+        subtitle      = "最新順"
+        for i, a in enumerate(articles[:10], 1):
+            title_esc = _escape(a["title"])
+            src_esc   = _escape(a["source"])
+            url       = a.get("link", "")
+            date_str  = (a["date"].strftime("%m/%d %H:%M")
+                         if a.get("date") else "")
+            summary_esc = _escape(a["summary"]) if a.get("summary") else ""
+            items_html += f"""
+    <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
+      <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
+        <span style="background:#fff3e0;color:#e65100;border-radius:3px;
+                     padding:1px 5px;font-size:10px;margin-right:6px;">
+          {src_esc}
+        </span>#{i}&nbsp;&nbsp;{date_str}
+      </div>
+      <div style="font-size:13px;font-weight:bold;line-height:1.5;
+                  color:#222;margin-bottom:3px;">{title_esc}</div>
+      {"<div style='font-size:12px;color:#555;line-height:1.5;'>" + summary_esc + "</div>" if summary_esc else ""}
+      {"<a href='" + _escape(url) + "' target='_blank' style='font-size:11px;color:#1976d2;text-decoration:none;'>→ 記事を読む ↗</a>" if url else ""}
+    </div>"""
 
     else:
         return (
@@ -306,12 +286,12 @@ def build_top_tweets_html(tweets: list, reddit: list,
         )
 
     return f"""
-  <h3 style="color:#b71c1c;margin:20px 0 4px;font-size:15px;">{section_title}</h3>
-  <div style="font-size:12px;color:#aaa;margin-bottom:8px;">エンゲージメント順</div>
+  <h3 style="color:#b71c1c;margin:20px 0 2px;font-size:15px;">{section_title}</h3>
+  <div style="font-size:11px;color:#aaa;margin-bottom:6px;">{subtitle}</div>
   {items_html}"""
 
 
-def build_html(products_md: str, tweets: list, reddit: list, stocktwits: list,
+def build_html(products_md: str, tweets: list, articles: list,
                date_str: str, time_label: str,
                since_str: str, now_str: str,
                has_twitter: bool) -> str:
@@ -329,12 +309,9 @@ def build_html(products_md: str, tweets: list, reddit: list, stocktwits: list,
         h = h.replace("\n---\n", "").replace("\n", "<br>")
         products_html = h
 
-    # ── TOP10ツイート（直接HTML描画）
-    top_tweets_html = build_top_tweets_html(tweets, reddit, stocktwits)
-
-    source_str = ("X (Twitter) / Reddit / StockTwits" if has_twitter
-                  else "Reddit / StockTwits")
-    icon = "🌅" if "朝" in time_label else "🌆"
+    top10_html   = build_top10_html(tweets, articles)
+    source_str   = ("X (Twitter) + RSS" if has_twitter else "RSS（Reuters・CNBC・WSJ 等）")
+    icon         = "🌅" if "朝" in time_label else "🌆"
 
     return f"""<!DOCTYPE html>
 <html lang="ja"><head>
@@ -345,7 +322,7 @@ def build_html(products_md: str, tweets: list, reddit: list, stocktwits: list,
              margin:0 auto;color:#333;font-size:14px;">
   <div style="background:#1a237e;color:white;padding:16px 24px;
               border-radius:8px 8px 0 0;">
-    <div style="font-size:20px;font-weight:bold;">{icon} 金融ソーシャルダイジェスト</div>
+    <div style="font-size:20px;font-weight:bold;">{icon} 金融ダイジェスト</div>
     <div style="font-size:12px;opacity:.85;margin-top:4px;">
       {date_str}　{time_label}
     </div>
@@ -356,7 +333,7 @@ def build_html(products_md: str, tweets: list, reddit: list, stocktwits: list,
   <div style="background:#fff;padding:20px 24px;border:1px solid #e8e8e8;
               border-top:none;line-height:1.85;">
     {products_html}
-    {top_tweets_html}
+    {top10_html}
   </div>
   <div style="background:#f5f5f5;padding:10px 24px;border:1px solid #e8e8e8;
               border-top:none;border-radius:0 0 8px 8px;text-align:center;">
@@ -398,30 +375,27 @@ def main():
     since_str  = since_sgt.strftime("%m/%d %H:%M SGT")
     now_str    = now_sgt.strftime("%m/%d %H:%M SGT")
 
-    print(f"=== 金融ソーシャルダイジェスト {date_str} {time_label} ===")
+    print(f"=== 金融ダイジェスト {date_str} {time_label} ===")
 
-    print("[1/4] X/Twitter 取得中...")
+    print("[1/4] RSS フィード取得中...")
+    articles = fetch_rss(hours=hours_back)
+
+    print("[2/4] X/Twitter 取得中...")
     tweets = fetch_twitter(hours=hours_back)
-    print(f"  → {len(tweets)} 件"
-          + (" (Twitter API なし)" if not tweets and not TWITTER_BEARER_TOKEN else ""))
+    if not tweets and not TWITTER_BEARER_TOKEN:
+        print("  → Twitter API なし（Bearer Token 未設定）")
 
-    print("[2/4] Reddit 取得中...")
-    reddit = fetch_reddit(hours=hours_back)
-    print(f"  → {len(reddit)} 件")
+    print("[3/4] Groq 投資商品サマリー生成中...")
+    products_md = summarize_products(articles, tweets, time_label)
 
-    print("[3/4] StockTwits 取得中...")
-    st = fetch_stocktwits()
-    print(f"  → {len(st)} 件")
-
-    print("[4/4] Groq 要約生成 & メール送信...")
-    products_md = summarize_products(tweets, reddit, st, time_label)
+    print("[4/4] メール送信中...")
     html = build_html(
-        products_md, tweets, reddit, st,
+        products_md, tweets, articles,
         date_str, time_label, since_str, now_str,
         bool(TWITTER_BEARER_TOKEN),
     )
-    subject = (f"{'🌅' if '朝' in time_label else '🌆'} 金融ソーシャル"
-               f" {now_sgt.strftime('%m/%d(%a)')} {time_label} | 注目商品・TOP10")
+    subject = (f"{'🌅' if '朝' in time_label else '🌆'} 金融ダイジェスト"
+               f" {now_sgt.strftime('%m/%d(%a)')} {time_label} | 注目商品・ニュース")
     send_email(subject, html)
 
 
