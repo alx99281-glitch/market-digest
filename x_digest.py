@@ -99,25 +99,36 @@ def fetch_reddit(hours: int = 13) -> list[dict]:
         "JapanFinance", "japan_investing",
     ]
     posts = []
-    for sub in subreddits:
-        try:
-            resp = requests.get(
-                f"https://www.reddit.com/r/{sub}/hot.json?limit=10",
-                headers=HEADERS, timeout=10,
-            )
-            if resp.status_code == 200:
-                for item in resp.json()["data"]["children"]:
-                    d = item["data"]
-                    posts.append({
-                        "title":    d["title"],
-                        "score":    d.get("score", 0),
-                        "comments": d.get("num_comments", 0),
-                        "sub":      sub,
-                        "url":      f"https://www.reddit.com{d.get('permalink', '')}",
-                    })
-        except Exception as e:
-            print(f"[WARN] Reddit r/{sub}: {e}")
-        time.sleep(0.3)
+    # www.reddit.com が bot ブロックする場合は old.reddit.com を試みる
+    for base_url in ["https://www.reddit.com", "https://old.reddit.com"]:
+        if posts:
+            break
+        for sub in subreddits:
+            try:
+                resp = requests.get(
+                    f"{base_url}/r/{sub}/hot.json?limit=10",
+                    headers=HEADERS, timeout=10,
+                )
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        for item in data["data"]["children"]:
+                            d = item["data"]
+                            posts.append({
+                                "title":    d["title"],
+                                "score":    d.get("score", 0),
+                                "comments": d.get("num_comments", 0),
+                                "sub":      sub,
+                                "url":      f"https://www.reddit.com{d.get('permalink', '')}",
+                            })
+                    except Exception:
+                        pass  # HTML が返った場合などはスキップ
+                elif resp.status_code == 429:
+                    print(f"[WARN] Reddit rate limit ({base_url})")
+                    break
+            except Exception as e:
+                print(f"[WARN] Reddit r/{sub} ({base_url}): {e}")
+            time.sleep(0.3)
 
     posts.sort(key=lambda x: x["score"] + x["comments"] * 2, reverse=True)
     return posts[:30]
@@ -195,12 +206,16 @@ def summarize_products(tweets: list, reddit: list, stocktwits: list,
 ---
 {body}
 """
-    resp = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
-    )
-    return resp.choices[0].message.content
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        print(f"[WARN] Groq error: {e}")
+        return ""
 
 
 # ── HTML 生成 ──────────────────────────────────────────────
@@ -212,7 +227,8 @@ def _escape(text: str) -> str:
                 .replace('"', "&quot;"))
 
 
-def build_top_tweets_html(tweets: list, reddit: list) -> str:
+def build_top_tweets_html(tweets: list, reddit: list,
+                          stocktwits: list | None = None) -> str:
     """TOP10ツイート（またはReddit投稿）を直接HTML描画。リンク付き。"""
     items_html = ""
 
@@ -261,8 +277,33 @@ def build_top_tweets_html(tweets: list, reddit: list) -> str:
       <div style="font-size:13px;line-height:1.6;color:#222;">{title_esc}</div>
       {"<div style='margin-top:5px;'><a href='" + url + "' target='_blank' style='font-size:11px;color:#1976d2;text-decoration:none;'>→ Reddit で見る ↗</a></div>" if url else ""}
     </div>"""
+    elif stocktwits:
+        # Twitter・Reddit 両方取得不可の場合は StockTwits トレンドシンボルを表示
+        section_title = "📊 StockTwits トレンドシンボル"
+        for i, s in enumerate(stocktwits[:15], 1):
+            sym   = _escape(s["symbol"])
+            title = _escape(s.get("title", ""))
+            url   = f"https://stocktwits.com/symbol/{s['symbol']}"
+            items_html += f"""
+    <div style="display:inline-block;margin:4px;">
+      <a href="{url}" target="_blank"
+         style="background:#e8f5e9;color:#2e7d32;padding:5px 10px;
+                border-radius:4px;text-decoration:none;font-size:12px;
+                font-weight:bold;">
+        {sym}
+        {"<span style='font-weight:normal;font-size:11px;color:#555;'>&nbsp;{}</span>".format(title) if title else ""}
+      </a>
+    </div>"""
+        return f"""
+  <h3 style="color:#b71c1c;margin:20px 0 8px;font-size:15px;">{section_title}</h3>
+  <div style="line-height:2.2;">{items_html}</div>"""
+
     else:
-        return ""
+        return (
+            "<p style='color:#aaa;font-size:12px;margin-top:16px;'>"
+            "⚠️ データソースへの接続に失敗しました。次回の配信をお待ちください。"
+            "</p>"
+        )
 
     return f"""
   <h3 style="color:#b71c1c;margin:20px 0 4px;font-size:15px;">{section_title}</h3>
@@ -270,7 +311,7 @@ def build_top_tweets_html(tweets: list, reddit: list) -> str:
   {items_html}"""
 
 
-def build_html(products_md: str, tweets: list, reddit: list,
+def build_html(products_md: str, tweets: list, reddit: list, stocktwits: list,
                date_str: str, time_label: str,
                since_str: str, now_str: str,
                has_twitter: bool) -> str:
@@ -289,7 +330,7 @@ def build_html(products_md: str, tweets: list, reddit: list,
         products_html = h
 
     # ── TOP10ツイート（直接HTML描画）
-    top_tweets_html = build_top_tweets_html(tweets, reddit)
+    top_tweets_html = build_top_tweets_html(tweets, reddit, stocktwits)
 
     source_str = ("X (Twitter) / Reddit / StockTwits" if has_twitter
                   else "Reddit / StockTwits")
@@ -375,7 +416,7 @@ def main():
     print("[4/4] Groq 要約生成 & メール送信...")
     products_md = summarize_products(tweets, reddit, st, time_label)
     html = build_html(
-        products_md, tweets, reddit,
+        products_md, tweets, reddit, st,
         date_str, time_label, since_str, now_str,
         bool(TWITTER_BEARER_TOKEN),
     )
