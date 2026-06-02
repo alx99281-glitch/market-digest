@@ -3,9 +3,9 @@
 X（Twitter）金融ソーシャルダイジェスト
 
 X/Twitter・Reddit・StockTwits から金融関連の注目投稿をピックアップし、
-  - 注目の金融商品・投資手法（最大5件）
+  - 注目の金融商品・投資手法（最大5件、具体的なティッカー付き）
   - 注目トピック（5件）
-を毎朝6時・夕方6時に送信する。
+を毎朝6時・夕方6時に送信する。各項目には引用元リンク付き。
 
 TWITTER_BEARER_TOKEN が設定されていれば X の実データを取得。
 未設定の場合は Reddit + StockTwits のみで動作。
@@ -70,8 +70,12 @@ def fetch_twitter(hours: int = 13) -> list[dict]:
                     eng = (m.get("like_count", 0)
                            + m.get("retweet_count", 0) * 2
                            + m.get("reply_count", 0))
-                    tweets.append({"text": t["text"], "engagement": eng,
-                                   "lang": t.get("lang", "")})
+                    tweets.append({
+                        "id":         t["id"],
+                        "text":       t["text"],
+                        "engagement": eng,
+                        "lang":       t.get("lang", ""),
+                    })
             elif resp.status_code == 429:
                 print("[WARN] Twitter rate limit")
                 break
@@ -107,6 +111,7 @@ def fetch_reddit(hours: int = 13) -> list[dict]:
                         "score":    d.get("score", 0),
                         "comments": d.get("num_comments", 0),
                         "sub":      sub,
+                        "url":      f"https://www.reddit.com{d.get('permalink', '')}",
                     })
         except Exception as e:
             print(f"[WARN] Reddit r/{sub}: {e}")
@@ -136,46 +141,64 @@ def fetch_stocktwits() -> list[dict]:
 # ── Groq 要約 ─────────────────────────────────────────────
 
 def summarize(tweets: list, reddit: list, stocktwits: list,
-              time_label: str) -> str:
+              time_label: str, since_str: str, now_str: str) -> tuple[str, dict]:
+    """
+    Returns:
+        summary  : Groq が生成したMarkdownテキスト（[N] 引用番号付き）
+        src_map  : {番号(int) -> URL(str)} の対応表
+    """
     client = Groq(api_key=GROQ_API_KEY)
 
-    body = f"=== 集計時刻: {time_label} ===\n\n"
+    # ── ソース番号→URL マップを構築 ──
+    src_map: dict[int, str] = {}
+    n = 1
+
+    body = f"=== 集計期間: {since_str} 〜 {now_str} ===\n\n"
 
     if tweets:
         body += "【X (Twitter) 高エンゲージメント投稿】\n"
-        for i, t in enumerate(tweets[:20], 1):
-            body += f"[{i}] ({t['lang']}) {t['text'][:200]} (eng:{t['engagement']})\n"
+        for t in tweets[:20]:
+            url = f"https://x.com/i/web/status/{t['id']}" if t.get("id") else ""
+            src_map[n] = url
+            body += (f"[{n}] ({t['lang']}) {t['text'][:200]}"
+                     f" (eng:{t['engagement']})\n")
+            n += 1
 
     if reddit:
         body += "\n【Reddit 金融コミュニティ 注目投稿】\n"
-        for i, p in enumerate(reddit[:20], 1):
-            body += f"[{i}] r/{p['sub']}: {p['title']} (score:{p['score']})\n"
+        for p in reddit[:20]:
+            src_map[n] = p.get("url", "")
+            body += f"[{n}] r/{p['sub']}: {p['title']} (score:{p['score']})\n"
+            n += 1
 
     if stocktwits:
         body += "\n【StockTwits トレンドシンボル】\n"
         body += "  ".join(f"{s['symbol']}({s['title']})" for s in stocktwits) + "\n"
 
-    sources = "X/Twitter・Reddit・StockTwits" if tweets else "Reddit・StockTwits"
+    sources_label = "X/Twitter・Reddit・StockTwits" if tweets else "Reddit・StockTwits"
 
     prompt = f"""あなたは金融ソーシャルメディアのアナリストです。
-以下は{sources}から収集した金融関連の投稿データです。
+以下は{sources_label}から収集した金融関連の投稿データです（各投稿には[番号]が振られています）。
 日本語でダイジェストを作成してください。
 
 【ルール】
 - 日本・米国・欧州など世界中の投稿を対象とする
 - 英語投稿は日本語に翻訳・要約する
 - 注目度・エンゲージメントの高いものを優先する
-- 「金融商品」には個別株・ETF・投資信託・債券・為替・仕組み商品・
-  仮想通貨・コモディティのほか、レバレッジ・空売りなどの投資手法も含む
+- 「金融商品」は必ず具体的な商品名・ティッカーシンボルで記載すること
+  （例: NVIDIA(NVDA)、DRAM ETF(SOXQ)、S&P500(SPY)、ドル円(USDJPY)、米10年債など）
+  個別株・ETF・投資信託・債券・為替・仕組み商品・仮想通貨・コモディティのほか、
+  レバレッジ・空売りなどの具体的な投資手法も含む
 - 言及が少ない場合は金融商品を省略してよい（5件に満たなくてもよい）
+- 各項目の末尾に、根拠となった投稿番号を [1][3] のように必ず引用すること
 
 【出力形式（必ずこの形式で）】
 
 ## 📈 注目の金融商品・投資手法（最大5件）
-1. **[商品名またはティッカー]** — 注目理由を1〜2文
+1. **[具体的な商品名・ティッカー]** — 注目理由を1〜2文 [引用番号]
 
 ## 💬 注目の金融トピック（5件）
-1. **[トピック名]** — 内容を1〜2文
+1. **[トピック名]** — 内容を1〜2文 [引用番号]
 
 ---
 {body}
@@ -185,14 +208,17 @@ def summarize(tweets: list, reddit: list, stocktwits: list,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=2048,
     )
-    return resp.choices[0].message.content
+    return resp.choices[0].message.content, src_map
 
 
 # ── HTML 生成 ──────────────────────────────────────────────
 
-def build_html(summary: str, date_str: str, time_label: str,
+def build_html(summary: str, src_map: dict,
+               date_str: str, time_label: str,
+               since_str: str, now_str: str,
                has_twitter: bool) -> str:
-    # Markdown → HTML
+
+    # Markdown → HTML（先にエスケープ）
     html = (summary
             .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
     html = re.sub(
@@ -206,6 +232,20 @@ def build_html(summary: str, date_str: str, time_label: str,
     html = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", html)
     html = re.sub(r"^(\d+)\. ", r"<br>&nbsp;\1. ", html, flags=re.MULTILINE)
     html = html.replace("\n---\n", "").replace("\n", "<br>")
+
+    # [N] → クリッカブルな上付き引用番号
+    def replace_citation(m):
+        num = int(m.group(1))
+        url = src_map.get(num, "")
+        if url:
+            return (
+                f"<sup><a href='{url}' target='_blank' "
+                f"style='color:#1976d2;text-decoration:none;font-size:10px;'>"
+                f"[{num}]</a></sup>"
+            )
+        return f"<sup style='font-size:10px;color:#999;'>[{num}]</sup>"
+
+    html = re.sub(r"\[(\d+)\]", replace_citation, html)
 
     source_str = ("X (Twitter) / Reddit / StockTwits" if has_twitter
                   else "Reddit / StockTwits")
@@ -223,6 +263,9 @@ def build_html(summary: str, date_str: str, time_label: str,
     <div style="font-size:20px;font-weight:bold;">{icon} 金融ソーシャルダイジェスト</div>
     <div style="font-size:12px;opacity:.85;margin-top:4px;">
       {date_str}　{time_label}
+    </div>
+    <div style="font-size:11px;opacity:.7;margin-top:3px;">
+      集計期間: {since_str} 〜 {now_str}
     </div>
   </div>
   <div style="background:#fff;padding:20px 24px;border:1px solid #e8e8e8;
@@ -264,14 +307,21 @@ def main():
     hour = now_sgt.hour
     time_label = "朝版（6:00 SGT）" if 4 <= hour < 14 else "夕版（18:00 SGT）"
 
+    # 集計期間
+    hours_back = 13
+    since_sgt  = now_sgt - timedelta(hours=hours_back)
+    since_str  = since_sgt.strftime("%m/%d %H:%M SGT")
+    now_str    = now_sgt.strftime("%m/%d %H:%M SGT")
+
     print(f"=== 金融ソーシャルダイジェスト {date_str} {time_label} ===")
 
     print("[1/4] X/Twitter 取得中...")
-    tweets = fetch_twitter(hours=13)
-    print(f"  → {len(tweets)} 件" + (" (Twitter API なし)" if not tweets and not TWITTER_BEARER_TOKEN else ""))
+    tweets = fetch_twitter(hours=hours_back)
+    print(f"  → {len(tweets)} 件"
+          + (" (Twitter API なし)" if not tweets and not TWITTER_BEARER_TOKEN else ""))
 
     print("[2/4] Reddit 取得中...")
-    reddit = fetch_reddit(hours=13)
+    reddit = fetch_reddit(hours=hours_back)
     print(f"  → {len(reddit)} 件")
 
     print("[3/4] StockTwits 取得中...")
@@ -279,8 +329,9 @@ def main():
     print(f"  → {len(st)} 件")
 
     print("[4/4] Groq 要約生成 & メール送信...")
-    summary = summarize(tweets, reddit, st, time_label)
-    html    = build_html(summary, date_str, time_label, bool(TWITTER_BEARER_TOKEN))
+    summary, src_map = summarize(tweets, reddit, st, time_label, since_str, now_str)
+    html = build_html(summary, src_map, date_str, time_label,
+                      since_str, now_str, bool(TWITTER_BEARER_TOKEN))
     subject = (f"{'🌅' if '朝' in time_label else '🌆'} 金融ソーシャル"
                f" {now_sgt.strftime('%m/%d(%a)')} {time_label} | 注目商品・トピック")
     send_email(subject, html)
