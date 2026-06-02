@@ -93,13 +93,25 @@ def run_regime_analysis() -> dict | None:
             date     = row["date"]
             lbl      = period_label(date)
             raw_feat = feat_records.get(date)
+
+            fwd_single = compute_forward_returns(prices, [date], WINDOW)
+            fwd_dict: dict = {}
+            if not fwd_single.empty:
+                ret_row = fwd_single.iloc[0]
+                for asset in ALL_ASSETS:
+                    if asset in ret_row.index:
+                        v = float(ret_row[asset])
+                        if not np.isnan(v):
+                            fwd_dict[asset] = round(v * 100, 1)
+
             top2.append({
-                "date":       date.strftime("%Y-%m-%d"),
-                "similarity": round(float(row["similarity"]), 4),
-                "label":      lbl,
-                "features":   {k: round(float(v), 4)
-                               for k, v in raw_feat.items()
-                               if not np.isnan(float(v))} if raw_feat is not None else {},
+                "date":            date.strftime("%Y-%m-%d"),
+                "similarity":      round(float(row["similarity"]), 4),
+                "label":           lbl,
+                "features":        {k: round(float(v), 4)
+                                    for k, v in raw_feat.items()
+                                    if not np.isnan(float(v))} if raw_feat is not None else {},
+                "forward_returns": fwd_dict,
             })
 
         price_snap = {k: round(float(v), 4) for k, v in current_raw.items()
@@ -128,7 +140,7 @@ def explain_regime(regime: dict) -> str:
                          for k, v in sorted(d.items(), key=lambda x: abs(x[1]), reverse=True))
 
     def fmt_yield(d):
-        return "\n".join(f"  {k}: {v:+.2f}pp"
+        return "\n".join(f"  {k}: {v:+.2f}%"
                          for k, v in sorted(d.items(), key=lambda x: abs(x[1]), reverse=True))
 
     similar_text = ""
@@ -140,10 +152,14 @@ def explain_regime(regime: dict) -> str:
         for k, v in sorted(price_f.items(), key=lambda x: abs(x[1]), reverse=True)[:6]:
             similar_text += f"  {k}: {'+' if v>0 else '-'}{abs(v)*100:.1f}%\n"
         for k, v in sorted(yield_f.items(), key=lambda x: abs(x[1]), reverse=True)[:3]:
-            similar_text += f"  {k}: {v:+.2f}pp\n"
-
-    out_names   = ", ".join(p["asset"] for p in regime["outperform"])
-    under_names = ", ".join(p["asset"] for p in regime["underperform"])
+            similar_text += f"  {k}: {v:+.2f}%\n"
+        fwd = p.get("forward_returns", {})
+        if fwd:
+            fwd_str = "  ".join(
+                f"{k}: {'+' if v>=0 else ''}{v:.1f}%"
+                for k, v in sorted(fwd.items(), key=lambda x: abs(x[1]), reverse=True)
+            )
+            similar_text += f"  ↓翌{regime['window']}日実績: {fwd_str}\n"
 
     prompt = f"""あなたはプロのマーケットアナリストです。以下の情報をもとに日本語で分析してください。
 
@@ -156,19 +172,17 @@ def explain_regime(regime: dict) -> str:
 【過去の類似局面トップ2（コサイン類似度）】
 {similar_text}
 
-【翌月アウトパフォーム候補】: {out_names}
-【翌月アンダーパフォーム候補】: {under_names}
-
 以下の形式で、簡潔に出力してください：
 
 ## 類似局面①: [日付] [局面名]
 - 現在と似ている点を2〜3点（箇条書き、数値は表を参照するため不要）
+- その後の特徴的な動き（翌月実績から読み取れること）
 
 ## 類似局面②: [日付] [局面名]
 - 同上
 
-## アウトパフォーム・アンダーパフォーム根拠
-- 各資産を1行で簡潔に
+## 今回の示唆
+- 2局面の共通点・相違点から読み取れる今後の注目ポイントを2〜3点
 """
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -198,7 +212,7 @@ def build_regime_table(regime: dict) -> str:
             return f"<span style='color:{color};font-weight:bold;'>{sign}{abs(v)*100:.1f}%</span>"
         else:
             color = "#c62828" if v > 0 else "#2e7d32"
-            return f"<span style='color:{color};'>{v:+.2f}pp</span>"
+            return f"<span style='color:{color};'>{v:+.2f}%</span>"
 
     # Feature order: price assets first, then yields
     price_keys = sorted(price_snap.keys(), key=lambda k: -abs(price_snap[k]))
@@ -424,16 +438,38 @@ def build_html(regime: dict | None, regime_exp: str,
                       f"margin:2px;font-size:11px;'>#{i} {p['date']}{lbl} "
                       f"({p['similarity']:.1%})</span>")
 
-        def badge(p, color):
-            sign = "+" if p["avg"] >= 0 else "-"
-            return (f"<span style='display:inline-block;background:{color};color:white;"
-                    f"border-radius:4px;padding:4px 10px;margin:3px;font-size:12px;"
-                    f"font-weight:bold;'>{p['asset']} {sign}{abs(p['avg']):.1f}%"
-                    f"&nbsp;<span style='opacity:.8;font-size:10px;'>勝率{p['hit']:.0f}%"
-                    f"</span></span>")
+        def fmt_ret(v):
+            if v is None:
+                return "<span style='color:#bbb;'>—</span>"
+            color = "#2e7d32" if v >= 0 else "#c62828"
+            sign  = "+" if v >= 0 else ""
+            return f"<span style='color:{color};font-weight:bold;'>{sign}{v:.1f}%</span>"
 
-        out_badges   = "".join(badge(p, "#2e7d32") for p in regime["outperform"])
-        under_badges = "".join(badge(p, "#c62828") for p in regime["underperform"])
+        fwd_headers = ""
+        for i, p in enumerate(regime["top2"], 1):
+            num = ["①", "②"][i - 1]
+            lbl_s = f"<br><small style='color:#888;font-weight:normal;'>{p['label'] or ''}</small>" if p["label"] else ""
+            fwd_headers += (f"<th style='padding:5px 8px;font-size:11px;text-align:center;"
+                            f"background:#e8f5e9;'>類似局面{num}<br>"
+                            f"<small style='color:#555;'>{p['date'][:7]}</small>{lbl_s}</th>")
+
+        all_assets = []
+        for p in regime["top2"]:
+            for a in p.get("forward_returns", {}).keys():
+                if a not in all_assets:
+                    all_assets.append(a)
+
+        fwd_rows = ""
+        for idx, asset in enumerate(all_assets):
+            bg = "#fff" if idx % 2 == 0 else "#fafafa"
+            cells = "".join(
+                f"<td style='padding:4px 8px;font-size:12px;text-align:center;'>"
+                f"{fmt_ret(p.get('forward_returns', {}).get(asset))}</td>"
+                for p in regime["top2"]
+            )
+            fwd_rows += (f"<tr style='background:{bg};'>"
+                         f"<td style='padding:4px 8px;font-size:12px;font-weight:bold;'>{asset}</td>"
+                         f"{cells}</tr>")
 
         regime_table = build_regime_table(regime)
 
@@ -451,13 +487,19 @@ def build_html(regime: dict | None, regime_exp: str,
                 line-height:1.7;border-left:3px solid #ef9a9a;margin-top:12px;margin-bottom:14px;">
       {exp_html}
     </div>
-    <div style="margin-bottom:8px;">
-      <span style="font-size:12px;color:#2e7d32;font-weight:bold;">▲ アウトパフォーム候補</span><br>
-      {out_badges}
-    </div>
-    <div>
-      <span style="font-size:12px;color:#c62828;font-weight:bold;">▼ アンダーパフォーム候補</span><br>
-      {under_badges}
+    <div style="margin-top:4px;">
+      <span style="font-size:12px;font-weight:bold;color:#555;">
+        📊 類似局面の翌{regime['window']}日リターン実績
+      </span>
+      <table style="width:100%;border-collapse:collapse;margin-top:6px;">
+        <thead>
+          <tr style="background:#f1f8e9;">
+            <th style="padding:5px 8px;font-size:11px;text-align:left;">資産</th>
+            {fwd_headers}
+          </tr>
+        </thead>
+        <tbody>{fwd_rows}</tbody>
+      </table>
     </div>
     <p style="font-size:10px;color:#ccc;margin:10px 0 0;">
       ※ 本分析は過去データに基づく参考情報です。投資判断を保証するものではありません。
