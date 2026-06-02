@@ -404,7 +404,8 @@ def build_pattern_chart(data: dict) -> str:
 
     plt.tight_layout()
     buf = _io.BytesIO()
-    plt.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.savefig(buf, format="jpeg", dpi=90, bbox_inches="tight",
+                pil_kwargs={"quality": 80, "optimize": True})
     plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode()
@@ -536,7 +537,7 @@ def build_html(regime: dict | None, regime_exp: str,
       📉 日経平均 チャートパターン分析
       （{pattern['current_start']} 〜 {pattern['current_end']}）
     </div>
-    <img src="data:image/png;base64,{chart_b64}"
+    <img src="data:image/jpeg;base64,{chart_b64}"
          style="width:100%;max-width:640px;border-radius:6px;display:block;"
          alt="パターン分析チャート">
     <div style="margin-top:14px;">
