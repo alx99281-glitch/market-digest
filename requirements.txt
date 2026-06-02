@@ -7,3 +7,4 @@ requests==2.32.3
 matplotlib==3.10.1
 pandas_datareader==0.10.0
 setuptools
+Pillow>=10.0.0
