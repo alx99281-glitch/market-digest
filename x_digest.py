@@ -2,14 +2,12 @@
 """
 金融ツイートダイジェスト
 
-直近24時間のエンゲージメント上位ツイートを
-  1. 📈 注目の投資商品・投資手法（最大5件）
-  2. 🗾 日本で話題のトピック（5件）
-  3. 🌍 海外で話題のトピック（5件）
-  4. 🔥 注目ツイート TOP10（リンク付き）
-にまとめて朝6時・夕18時（SGT）に送信する。
+直近24時間のエンゲージメント上位ツイートをそのまま表示する。
+  🗾 日本語ツイート TOP5
+  🌍 英語ツイート TOP5
+  🔥 全体 TOP10
 
-Twitter Bearer Token 未設定時は RSS フィードにフォールバック。
+Twitter Bearer Token 未設定時は RSS ニュースにフォールバック。
 """
 
 import os
@@ -23,38 +21,30 @@ from email.mime.text import MIMEText
 import feedparser
 import pytz
 import requests
-from groq import Groq
 
 # ── 設定 ─────────────────────────────────────────────────
-GROQ_API_KEY         = os.environ["GROQ_API_KEY"]
 GMAIL_USER           = os.environ.get("GMAIL_USER", "alx99281@gmail.com")
 GMAIL_APP_PASSWORD   = os.environ["GMAIL_APP_PASSWORD"]
 TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; market-digest-bot/1.0)"}
 
-# ── RSS フォールバック用フィード ───────────────────────────
 RSS_FEEDS = {
-    "NHK経済":          "https://www.nhk.or.jp/rss/news/cat6.xml",
-    "ロイター(日本語)":  "https://jp.reuters.com/rssFeed/businessNews",
-    "株探":              "https://kabutan.jp/rss/news.xml",
-    "Reuters(EN)":       "https://feeds.reuters.com/reuters/businessNews",
-    "CNBC":              "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "WSJ Markets":       "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "Yahoo Finance":     "https://finance.yahoo.com/news/rssindex",
+    "NHK経済":         "https://www.nhk.or.jp/rss/news/cat6.xml",
+    "ロイター(日本語)": "https://jp.reuters.com/rssFeed/businessNews",
+    "株探":             "https://kabutan.jp/rss/news.xml",
+    "Reuters(EN)":     "https://feeds.reuters.com/reuters/businessNews",
+    "CNBC":            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "WSJ Markets":     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "Yahoo Finance":   "https://finance.yahoo.com/news/rssindex",
 }
-
-JP_SOURCES  = {"NHK経済", "ロイター(日本語)", "株探"}
-OV_SOURCES  = {"Reuters(EN)", "CNBC", "WSJ Markets", "Yahoo Finance"}
+RSS_JP = {"NHK経済", "ロイター(日本語)", "株探"}
 
 
 # ── Twitter 取得 ──────────────────────────────────────────
 
 def fetch_twitter(hours: int = 24) -> tuple[list[dict], list[dict]]:
-    """
-    直近 hours 時間の金融ツイートをエンゲージメント順で返す。
-    Returns: (ja_tweets, en_tweets)  各最大20件
-    """
+    """直近 hours 時間の金融ツイートを取得。(ja, en) に分けて返す。"""
     if not TWITTER_BEARER_TOKEN:
         return [], []
 
@@ -64,14 +54,14 @@ def fetch_twitter(hours: int = 24) -> tuple[list[dict], list[dict]]:
 
     queries = {
         "ja": ("(株 OR 日経 OR 為替 OR 金利 OR ETF OR 投資信託 OR 債券"
-               " OR 不動産 OR マンション OR REIT OR 仮想通貨 OR ビットコイン)"
-               " lang:ja -is:retweet -is:reply"),
+               " OR 不動産 OR マンション OR REIT OR 仮想通貨 OR ビットコイン"
+               " OR レバレッジ OR 空売り) lang:ja -is:retweet -is:reply"),
         "en": ("(stocks OR investing OR markets OR Fed OR SPX OR Nikkei"
-               " OR ETF OR bond OR forex OR crypto OR bitcoin OR realestate)"
-               " lang:en -is:retweet -is:reply"),
+               " OR ETF OR bond OR forex OR crypto OR bitcoin OR realestate"
+               " OR earnings OR inflation) lang:en -is:retweet -is:reply"),
     }
 
-    results = {}
+    results: dict[str, list] = {}
     for lang, query in queries.items():
         tweets = []
         try:
@@ -88,24 +78,24 @@ def fetch_twitter(hours: int = 24) -> tuple[list[dict], list[dict]]:
             )
             if resp.status_code == 200:
                 for t in resp.json().get("data", []):
-                    m   = t.get("public_metrics", {})
+                    m = t.get("public_metrics", {})
                     eng = (m.get("like_count", 0)
                            + m.get("retweet_count", 0) * 2
                            + m.get("reply_count", 0))
                     tweets.append({
-                        "id":         t["id"],
-                        "text":       t["text"],
-                        "engagement": eng,
-                        "lang":       t.get("lang", lang),
-                        "likes":      m.get("like_count", 0),
-                        "retweets":   m.get("retweet_count", 0),
+                        "id":       t["id"],
+                        "text":     t["text"],
+                        "eng":      eng,
+                        "likes":    m.get("like_count", 0),
+                        "retweets": m.get("retweet_count", 0),
+                        "lang":     lang,
                     })
-                tweets.sort(key=lambda x: x["engagement"], reverse=True)
-                print(f"  → Twitter {lang.upper()}: {len(tweets)} 件")
+                tweets.sort(key=lambda x: x["eng"], reverse=True)
+                print(f"  Twitter {lang.upper()}: {len(tweets)} 件")
             elif resp.status_code == 429:
                 print(f"[WARN] Twitter rate limit ({lang})")
             else:
-                print(f"[WARN] Twitter {lang} {resp.status_code}: {resp.text[:150]}")
+                print(f"[WARN] Twitter {lang} {resp.status_code}: {resp.text[:120]}")
         except Exception as e:
             print(f"[WARN] Twitter {lang}: {e}")
         results[lang] = tweets[:20]
@@ -116,223 +106,146 @@ def fetch_twitter(hours: int = 24) -> tuple[list[dict], list[dict]]:
 
 # ── RSS フォールバック ─────────────────────────────────────
 
-def fetch_rss_fallback(hours: int = 24) -> tuple[list[dict], list[dict]]:
-    """Twitter 取得不可時に RSS から日本・海外記事を返す"""
+def fetch_rss(hours: int = 24) -> tuple[list[dict], list[dict]]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     jp, ov = [], []
-
     for source, url in RSS_FEEDS.items():
         try:
             feed = feedparser.parse(url,
                        request_headers={"User-Agent": "Mozilla/5.0"})
-            for entry in feed.entries[:20]:
-                pub    = entry.get("published_parsed") or entry.get("updated_parsed")
+            for e in feed.entries[:20]:
+                pub = e.get("published_parsed") or e.get("updated_parsed")
                 pub_dt = datetime(*pub[:6], tzinfo=timezone.utc) if pub else None
                 if pub_dt and pub_dt < cutoff:
                     continue
                 item = {
                     "source":  source,
-                    "title":   entry.get("title", "").strip(),
+                    "title":   e.get("title", "").strip(),
                     "summary": re.sub(r"<[^>]+>", "",
-                               entry.get("summary",
-                               entry.get("description", ""))).strip()[:200],
-                    "link":    entry.get("link", ""),
+                               e.get("summary", e.get("description", ""))).strip()[:200],
+                    "link":    e.get("link", ""),
                     "date":    pub_dt,
                 }
-                if source in JP_SOURCES:
-                    jp.append(item)
-                else:
-                    ov.append(item)
-        except Exception as e:
-            print(f"[WARN] RSS {source}: {e}")
+                (jp if source in RSS_JP else ov).append(item)
+        except Exception as ex:
+            print(f"[WARN] RSS {source}: {ex}")
         time.sleep(0.2)
 
-    jp.sort(key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    ov.sort(key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    print(f"  → RSS JP:{len(jp)} OV:{len(ov)} 件")
-    return jp[:20], ov[:20]
+    srt = lambda lst: sorted(
+        lst, key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True)
+    jp, ov = srt(jp)[:20], srt(ov)[:20]
+    print(f"  RSS JP:{len(jp)} OV:{len(ov)} 件")
+    return jp, ov
 
 
-# ── Groq 要約 ─────────────────────────────────────────────
-
-def summarize(tw_ja: list, tw_en: list,
-              jp_articles: list, ov_articles: list) -> str:
-    """
-    ツイート（あれば優先）またはRSS記事から3セクションを生成。
-    ## 📈 注目の投資商品・投資手法
-    ## 🗾 日本で話題のトピック
-    ## 🌍 海外で話題のトピック
-    """
-    client = Groq(api_key=GROQ_API_KEY)
-
-    body = ""
-    use_twitter = bool(tw_ja or tw_en)
-
-    if tw_ja:
-        body += "【日本語ツイート（エンゲージメント順）】\n"
-        for i, t in enumerate(tw_ja[:15], 1):
-            body += f"{i}. {t['text'][:200]}  (♥{t['likes']} RT{t['retweets']})\n"
-        body += "\n"
-
-    if tw_en:
-        body += "【英語ツイート（エンゲージメント順）】\n"
-        for i, t in enumerate(tw_en[:15], 1):
-            body += f"{i}. {t['text'][:200]}  (♥{t['likes']} RT{t['retweets']})\n"
-        body += "\n"
-
-    if jp_articles:
-        body += "【日本ニュース（RSS）】\n"
-        for a in jp_articles[:15]:
-            body += f"- [{a['source']}] {a['title']}  {a['summary'][:120]}\n"
-        body += "\n"
-
-    if ov_articles:
-        body += "【海外ニュース（RSS）】\n"
-        for a in ov_articles[:15]:
-            body += f"- [{a['source']}] {a['title']}  {a['summary'][:120]}\n"
-        body += "\n"
-
-    if not body.strip():
-        return ""
-
-    src_desc = "X/Twitterのツイート" if use_twitter else "金融ニュース"
-
-    prompt = f"""あなたは金融メディアのアナリストです。
-以下の直近24時間の{src_desc}データをもとに、3つのセクションを日本語で作成してください。
-
-【ルール】
-- 投資商品は必ず具体的な商品名・ティッカーで書く
-  （例: NVIDIA(NVDA)、S&P500(SPY)、ドル円(USDJPY)、米10年債、東京マンション、Bitcoin(BTC)）
-- 「日本で話題」は日本語データ、「海外で話題」は英語データから優先的に抽出
-- 各項目は太字（**名前**）＋1〜2文の説明
-- 余分なテキストや前置きは不要
-
-【出力形式（この3セクションのみ）】
-
-## 📈 注目の投資商品・投資手法（最大5件）
-1. **[商品名・ティッカー]** — 注目理由
-
-## 🗾 日本で話題のトピック（5件）
-1. **[トピック名]** — 内容
-
-## 🌍 海外で話題のトピック（5件）
-1. **[トピック名]** — 内容
-
----
-{body}"""
-
-    try:
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
-        )
-        result = resp.choices[0].message.content
-        print(f"  → Groq: {len(result)} 文字")
-        return result
-    except Exception as e:
-        print(f"[WARN] Groq error: {e}")
-        return ""
-
-
-# ── HTML 生成 ──────────────────────────────────────────────
+# ── HTML パーツ ───────────────────────────────────────────
 
 def _esc(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;")
              .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def md_to_html(md: str) -> str:
-    h = _esc(md)
-    h = re.sub(r"## (📈[^\n]*)",
-        r"<h3 style='color:#2e7d32;margin:20px 0 4px;font-size:15px;'>\1</h3>", h)
-    h = re.sub(r"## (🗾[^\n]*)",
-        r"<h3 style='color:#c62828;margin:20px 0 4px;font-size:15px;'>\1</h3>", h)
-    h = re.sub(r"## (🌍[^\n]*)",
-        r"<h3 style='color:#1565c0;margin:20px 0 4px;font-size:15px;'>\1</h3>", h)
-    h = re.sub(r"\*\*(.*?)\*\*", r"<strong>\1</strong>", h)
-    h = re.sub(r"^(\d+)\. ", r"<br>&nbsp;\1. ", h, flags=re.MULTILINE)
-    h = h.replace("\n---\n", "").replace("\n", "<br>")
-    return h
+def tweet_card(t: dict, rank: int) -> str:
+    url  = f"https://x.com/i/web/status/{t['id']}"
+    lang = t.get("lang", "").upper()
+    bg   = "#fce4ec" if lang == "JA" else "#e3f2fd"
+    fg   = "#c62828" if lang == "JA" else "#1565c0"
+    tag  = (f"<span style='background:{bg};color:{fg};border-radius:3px;"
+            f"padding:1px 6px;font-size:10px;margin-right:6px;'>{lang}</span>"
+            ) if lang else ""
+    return f"""
+<div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
+  <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
+    {tag}#{rank}&nbsp;&nbsp;♥{t['likes']:,}&nbsp;&nbsp;RT{t['retweets']:,}
+  </div>
+  <div style="font-size:13px;line-height:1.65;color:#222;">{_esc(t['text'])}</div>
+  <a href="{url}" target="_blank"
+     style="font-size:11px;color:#1976d2;text-decoration:none;display:inline-block;margin-top:3px;">
+    → X で見る ↗
+  </a>
+</div>"""
 
 
-def build_top10_html(tw_ja: list, tw_en: list,
-                     jp_rss: list, ov_rss: list) -> str:
-    """ツイートがあればTOP10ツイート、なければRSSニュースTOP10"""
-    all_tweets = sorted(tw_ja + tw_en,
-                        key=lambda x: x["engagement"], reverse=True)
+def rss_card(a: dict, rank: int) -> str:
+    date_s = a["date"].strftime("%m/%d %H:%M") if a.get("date") else ""
+    lnk    = (f"<a href='{_esc(a['link'])}' target='_blank' "
+              f"style='font-size:11px;color:#1976d2;text-decoration:none;'>"
+              f"→ 記事を読む ↗</a>") if a.get("link") else ""
+    return f"""
+<div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
+  <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
+    <span style="background:#fff3e0;color:#e65100;border-radius:3px;
+                 padding:1px 5px;font-size:10px;margin-right:6px;">{_esc(a['source'])}</span>
+    #{rank}&nbsp;{date_s}
+  </div>
+  <div style="font-size:13px;font-weight:bold;line-height:1.5;color:#222;">{_esc(a['title'])}</div>
+  {"<div style='font-size:12px;color:#555;margin-top:2px;'>" + _esc(a.get('summary','')) + "</div>" if a.get('summary') else ""}
+  {lnk}
+</div>"""
 
-    if all_tweets:
-        title    = "🔥 注目ツイート TOP10"
-        subtitle = "直近24時間・エンゲージメント順"
-        rows = ""
-        for i, t in enumerate(all_tweets[:10], 1):
-            url     = f"https://x.com/i/web/status/{t['id']}"
-            lang    = t.get("lang", "").upper()
-            bg, fg  = ("#fce4ec", "#c62828") if lang == "JA" else ("#e3f2fd", "#1565c0")
-            tag     = (f"<span style='background:{bg};color:{fg};border-radius:3px;"
-                       f"padding:1px 6px;font-size:10px;margin-right:6px;'>{_esc(lang)}</span>"
-                       ) if lang else ""
-            rows += f"""
-      <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
-        <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
-          {tag}#{i}&nbsp; ♥{t['likes']:,}&nbsp; RT{t['retweets']:,}
-        </div>
-        <div style="font-size:13px;line-height:1.6;color:#222;">{_esc(t['text'])}</div>
-        <a href="{url}" target="_blank"
-           style="font-size:11px;color:#1976d2;text-decoration:none;">
-          → X で見る ↗
-        </a>
-      </div>"""
+
+def section(icon: str, title: str, subtitle: str, cards_html: str,
+            title_color: str = "#b71c1c") -> str:
+    return (f"<h3 style='color:{title_color};margin:22px 0 2px;font-size:15px;'>"
+            f"{icon} {title}</h3>"
+            f"<div style='font-size:11px;color:#aaa;margin-bottom:4px;'>{subtitle}</div>"
+            f"{cards_html}")
+
+
+def build_html(tw_ja: list, tw_en: list, jp_rss: list, ov_rss: list,
+               date_str: str, time_label: str,
+               since_str: str, now_str: str) -> str:
+
+    use_twitter = bool(tw_ja or tw_en)
+    icon_hdr    = "🌅" if "朝" in time_label else "🌆"
+    src_note    = "X (Twitter) · 直近24h" if use_twitter else "RSS（Reuters・CNBC・WSJ・NHK）"
+    sections    = []
+
+    if use_twitter:
+        # 🗾 日本語 TOP5
+        if tw_ja:
+            cards = "".join(tweet_card(t, i) for i, t in enumerate(tw_ja[:5], 1))
+            sections.append(section("🗾", "日本で話題", "日本語ツイート・エンゲージメント順",
+                                    cards, "#c62828"))
+
+        # 🌍 英語 TOP5
+        if tw_en:
+            cards = "".join(tweet_card(t, i) for i, t in enumerate(tw_en[:5], 1))
+            sections.append(section("🌍", "海外で話題", "英語ツイート・エンゲージメント順",
+                                    cards, "#1565c0"))
+
+        # 🔥 全体 TOP10
+        all_tw = sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
+        if all_tw:
+            cards = "".join(tweet_card(t, i) for i, t in enumerate(all_tw[:10], 1))
+            sections.append(section("🔥", "総合ランキング TOP10",
+                                    "JA + EN 合算・エンゲージメント順", cards, "#b71c1c"))
 
     else:
-        title    = "📰 注目金融ニュース TOP10"
-        subtitle = "直近24時間・最新順"
-        # 日本・海外を交互に
+        # RSS フォールバック
+        if jp_rss:
+            cards = "".join(rss_card(a, i) for i, a in enumerate(jp_rss[:5], 1))
+            sections.append(section("🗾", "日本のニュース", "最新順", cards, "#c62828"))
+        if ov_rss:
+            cards = "".join(rss_card(a, i) for i, a in enumerate(ov_rss[:5], 1))
+            sections.append(section("🌍", "海外のニュース", "最新順", cards, "#1565c0"))
+
+        # 全体TOP10（日本・海外交互）
         merged, qi, qo = [], list(jp_rss[:5]), list(ov_rss[:5])
         while qi or qo:
             if qi: merged.append(qi.pop(0))
             if qo: merged.append(qo.pop(0))
-        merged = merged[:10]
+        if merged:
+            cards = "".join(rss_card(a, i) for i, a in enumerate(merged[:10], 1))
+            sections.append(section("📰", "総合ニュース TOP10",
+                                    "日本・海外交互・最新順", cards, "#b71c1c"))
 
-        if not merged:
-            return ("<p style='color:#aaa;font-size:12px;margin-top:16px;'>"
-                    "⚠️ データ取得に失敗しました。次回の配信をお待ちください。</p>")
-
-        rows = ""
-        for i, a in enumerate(merged, 1):
-            date_s = a["date"].strftime("%m/%d %H:%M") if a.get("date") else ""
-            lnk    = (f"<a href='{_esc(a['link'])}' target='_blank' "
-                      f"style='font-size:11px;color:#1976d2;text-decoration:none;'>"
-                      f"→ 記事を読む ↗</a>") if a.get("link") else ""
-            rows += f"""
-      <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
-        <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
-          <span style="background:#fff3e0;color:#e65100;border-radius:3px;
-                       padding:1px 5px;font-size:10px;margin-right:6px;">
-            {_esc(a['source'])}</span>#{i}&nbsp;{date_s}
-        </div>
-        <div style="font-size:13px;font-weight:bold;line-height:1.5;color:#222;">
-          {_esc(a['title'])}</div>
-        {"<div style='font-size:12px;color:#555;'>" + _esc(a['summary']) + "</div>" if a.get("summary") else ""}
-        {lnk}
-      </div>"""
-
-    return (f"<h3 style='color:#b71c1c;margin:20px 0 2px;font-size:15px;'>{title}</h3>"
-            f"<div style='font-size:11px;color:#aaa;margin-bottom:4px;'>{subtitle}</div>"
-            f"{rows}")
-
-
-def build_html(summary_md: str, tw_ja: list, tw_en: list,
-               jp_rss: list, ov_rss: list,
-               date_str: str, time_label: str,
-               since_str: str, now_str: str,
-               has_twitter: bool) -> str:
-
-    body_html  = md_to_html(summary_md) if summary_md else ""
-    top10_html = build_top10_html(tw_ja, tw_en, jp_rss, ov_rss)
-    src_note   = "X (Twitter)" if has_twitter else "RSS（Reuters・CNBC・WSJ・NHK 等）"
-    icon       = "🌅" if "朝" in time_label else "🌆"
+    if not sections:
+        body_html = ("<p style='color:#aaa;font-size:13px;'>"
+                     "⚠️ データ取得に失敗しました。次回の配信をお待ちください。</p>")
+    else:
+        body_html = "\n".join(sections)
 
     return f"""<!DOCTYPE html>
 <html lang="ja"><head>
@@ -342,22 +255,19 @@ def build_html(summary_md: str, tw_ja: list, tw_en: list,
 <body style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:640px;
              margin:0 auto;color:#333;font-size:14px;">
   <div style="background:#1a237e;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
-    <div style="font-size:20px;font-weight:bold;">{icon} 金融ダイジェスト</div>
+    <div style="font-size:20px;font-weight:bold;">{icon_hdr} 金融ダイジェスト</div>
     <div style="font-size:12px;opacity:.85;margin-top:4px;">{date_str}　{time_label}</div>
     <div style="font-size:11px;opacity:.7;margin-top:3px;">
-      集計期間: {since_str} 〜 {now_str} ／ ソース: {src_note}
+      集計期間: {since_str} 〜 {now_str} ／ {src_note}
     </div>
   </div>
   <div style="background:#fff;padding:20px 24px;border:1px solid #e8e8e8;
               border-top:none;line-height:1.85;">
     {body_html}
-    {top10_html}
   </div>
   <div style="background:#f5f5f5;padding:10px 24px;border:1px solid #e8e8e8;
               border-top:none;border-radius:0 0 8px 8px;text-align:center;">
-    <p style="font-size:10px;color:#bbb;margin:0;">
-      Powered by Groq (Llama 3.3 70B) · {src_note}
-    </p>
+    <p style="font-size:10px;color:#bbb;margin:0;">ソース: {src_note}</p>
   </div>
 </body></html>"""
 
@@ -390,35 +300,33 @@ def main():
     hours_back = 24
     since_str  = (now_sgt - timedelta(hours=hours_back)).strftime("%m/%d %H:%M SGT")
     now_str    = now_sgt.strftime("%m/%d %H:%M SGT")
+    subject    = (f"{'🌅' if '朝' in time_label else '🌆'} 金融ダイジェスト"
+                  f" {now_sgt.strftime('%m/%d(%a)')} {time_label}")
 
-    print(f"=== 金融ダイジェスト {date_str} {time_label} ===")
+    print(f"=== {subject} ===")
 
     try:
-        print("[1/4] Twitter 取得中（直近24h）...")
+        print("[1/3] Twitter 取得中（直近24h）...")
         tw_ja, tw_en = fetch_twitter(hours=hours_back)
 
         jp_rss, ov_rss = [], []
         if not (tw_ja or tw_en):
-            print("[1b] Twitter 取得なし → RSS フォールバック...")
-            jp_rss, ov_rss = fetch_rss_fallback(hours=hours_back)
+            print("[1b] Twitter なし → RSS フォールバック...")
+            jp_rss, ov_rss = fetch_rss(hours=hours_back)
 
-        print("[2/4] Groq サマリー生成中...")
-        summary_md = summarize(tw_ja, tw_en, jp_rss, ov_rss)
-
-        print("[3/4] HTML 生成中...")
-        html = build_html(
-            summary_md, tw_ja, tw_en, jp_rss, ov_rss,
-            date_str, time_label, since_str, now_str,
-            bool(tw_ja or tw_en),
-        )
+        print("[2/3] HTML 生成中...")
+        html  = build_html(tw_ja, tw_en, jp_rss, ov_rss,
+                           date_str, time_label, since_str, now_str)
 
         # プレーンテキスト（スパムフィルタ対策）
-        plain = re.sub(r"\*\*(.*?)\*\*", r"\1",
-                re.sub(r"^## ", "", summary_md, flags=re.MULTILINE)) if summary_md else subject
+        plain_lines = [subject, ""]
+        for t in (tw_ja + tw_en)[:10]:
+            plain_lines.append(f"♥{t['likes']} RT{t['retweets']}  {t['text'][:100]}")
+            plain_lines.append(f"https://x.com/i/web/status/{t['id']}")
+            plain_lines.append("")
+        plain = "\n".join(plain_lines)
 
-        print("[4/4] メール送信中...")
-        subject = (f"{'🌅' if '朝' in time_label else '🌆'} 金融ダイジェスト"
-                   f" {now_sgt.strftime('%m/%d(%a)')} {time_label}")
+        print("[3/3] メール送信中...")
         send_email(subject, html, plain)
 
     except Exception as e:
