@@ -40,6 +40,29 @@ RSS_FEEDS = {
 }
 RSS_JP = {"NHK経済", "ロイター(日本語)", "株探"}
 
+# 投資商品・ティッカー検出キーワード（大文字小文字不問）
+PRODUCT_KEYWORDS = [
+    # 個別株・ティッカー
+    "nvda", "nvidia", "tsla", "tesla", "aapl", "apple", "msft", "microsoft",
+    "amzn", "amazon", "meta", "googl", "google", "7203", "7974", "softbank",
+    "ソフトバンク", "トヨタ", "ソニー",
+    # 指数・ETF
+    "s&p", "s&p500", "spy", "qqq", "nasdaq", "dow", "日経", "nikkei", "topix",
+    "etf", "投資信託",
+    # 債券・金利
+    "10年債", "米国債", "treasury", "bond", "yield", "金利",
+    # 為替
+    "ドル円", "usdjpy", "eurusd", "ユーロ", "為替", "fx",
+    # コモディティ
+    "gold", "金価格", "原油", "oil", "wti", "copper", "銅",
+    # 仮想通貨
+    "bitcoin", "btc", "ethereum", "eth", "crypto", "仮想通貨", "ビットコイン",
+    # 不動産
+    "reit", "不動産", "マンション", "real estate",
+    # 投資手法
+    "レバレッジ", "空売り", "leverage", "short",
+]
+
 
 # ── Twitter 取得 ──────────────────────────────────────────
 
@@ -193,6 +216,18 @@ def section(icon: str, title: str, subtitle: str, cards_html: str,
             f"{cards_html}")
 
 
+def filter_product_tweets(tweets: list, top_n: int = 5) -> list[dict]:
+    """投資商品・ティッカーに言及しているツイートをエンゲージメント順で返す"""
+    matched = []
+    for t in tweets:
+        text_lower = t["text"].lower()
+        if any(kw in text_lower for kw in PRODUCT_KEYWORDS):
+            matched.append(t)
+    # エンゲージメント順（既にソート済みのはずだが念のため）
+    matched.sort(key=lambda x: x["eng"], reverse=True)
+    return matched[:top_n]
+
+
 def build_html(tw_ja: list, tw_en: list, jp_rss: list, ov_rss: list,
                date_str: str, time_label: str,
                since_str: str, now_str: str) -> str:
@@ -203,6 +238,16 @@ def build_html(tw_ja: list, tw_en: list, jp_rss: list, ov_rss: list,
     sections    = []
 
     if use_twitter:
+        # 📈 投資商品 TOP5（JA+EN合算からキーワードフィルタ）
+        product_tw = filter_product_tweets(
+            sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
+        )
+        if product_tw:
+            cards = "".join(tweet_card(t, i) for i, t in enumerate(product_tw, 1))
+            sections.append(section("📈", "注目の投資商品",
+                                    "商品・ティッカー言及ツイート・エンゲージメント順",
+                                    cards, "#2e7d32"))
+
         # 🗾 日本語 TOP5
         if tw_ja:
             cards = "".join(tweet_card(t, i) for i, t in enumerate(tw_ja[:5], 1))
