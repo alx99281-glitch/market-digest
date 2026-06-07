@@ -31,7 +31,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from pandas_datareader import data as pdr
+import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
@@ -57,25 +57,23 @@ NOTABLE_PERIODS = {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# 資産ユニバース定義（全てFREDから取得 — APIキー不要）
+# 資産ユニバース定義（yfinance から取得）
 # ────────────────────────────────────────────────────────────────────────────
-FRED_PRICE_SERIES: dict[str, str] = {
-    "NKY":    "NIKKEI225",           # 日経225 (JPY)
-    "SPX":    "SP500",               # S&P500
-    "NDQ":    "NASDAQCOM",           # NASDAQ総合
-    "USDJPY": "DEXJPUS",             # 円/ドル (JPY per USD)
-    "EURUSD": "DEXUSEU",             # ユーロ/ドル (USD per EUR)
-    "Gold":   "GOLDAMGBD228NLBM",    # 金価格 (USD/troy oz)
+YFINANCE_PRICE_TICKERS: dict[str, str] = {
+    "NKY":    "^N225",      # 日経225
+    "SPX":    "^GSPC",      # S&P500
+    "NDQ":    "^IXIC",      # NASDAQ総合
+    "USDJPY": "JPY=X",      # 円/ドル (JPY per USD)
+    "EURUSD": "EURUSD=X",   # ユーロ/ドル
+    "Gold":   "GC=F",       # 金先物 (USD/oz)
 }
 
-FRED_YIELD_SERIES: dict[str, str] = {
-    "US2Y":     "DGS2",
-    "US10Y":    "DGS10",
-    "JP10Y":    "IRLTLT01JPM156N",
-    "FEDFUNDS": "FEDFUNDS",
+YFINANCE_YIELD_TICKERS: dict[str, str] = {
+    "US2Y":  "^IRX",   # 13週T-bill（短期金利プロキシ）
+    "US10Y": "^TNX",   # 米10年債利回り
 }
 
-ALL_ASSETS = list(FRED_PRICE_SERIES.keys())
+ALL_ASSETS = list(YFINANCE_PRICE_TICKERS.keys())
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -101,22 +99,38 @@ def _cache_load(name: str, max_age_hours: float = 6.0) -> Optional[object]:
 
 
 
+def _yf_download(ticker: str, start: str, end: str) -> pd.Series:
+    """yfinance で1銘柄の終値を取得して Series で返す（timezone除去済み）"""
+    df = yf.download(ticker, start=start, end=end,
+                     auto_adjust=True, progress=False, multi_level_index=False)
+    if df.empty:
+        return pd.Series(dtype=float)
+    close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close.index = pd.to_datetime(close.index)
+    if hasattr(close.index, "tz") and close.index.tz is not None:
+        close.index = close.index.tz_localize(None)
+    return close.dropna()
+
+
 def load_prices(years: int = FETCH_YEARS, use_cache: bool = True) -> pd.DataFrame:
     today = datetime.today()
-    start = today - timedelta(days=years * 365 + 90)
+    start = (today - timedelta(days=years * 365 + 90)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
 
-    print(f"  価格データ: FRED から {start.strftime('%Y-%m-%d')} 〜 取得中...")
+    print(f"  価格データ: yfinance から {start} 〜 取得中...")
     frames: dict[str, pd.Series] = {}
-    for name, sid in FRED_PRICE_SERIES.items():
+    for name, ticker in YFINANCE_PRICE_TICKERS.items():
         try:
-            series = pdr.DataReader(sid, "fred", start, today)[sid].dropna()
+            series = _yf_download(ticker, start, end)
             if not series.empty:
                 frames[name] = series
-                print(f"    ✓ {name} ({sid}): {len(series)}件")
+                print(f"    ✓ {name} ({ticker}): {len(series)}件")
             else:
-                print(f"    - {name} ({sid}): データなし")
+                print(f"    - {name} ({ticker}): データなし")
         except Exception as e:
-            print(f"    × {name} ({sid}): {e}", file=sys.stderr)
+            print(f"    × {name} ({ticker}): {e}", file=sys.stderr)
 
     if not frames:
         return pd.DataFrame()
@@ -127,20 +141,21 @@ def load_prices(years: int = FETCH_YEARS, use_cache: bool = True) -> pd.DataFram
 
 def load_yields(years: int = FETCH_YEARS, use_cache: bool = True) -> pd.DataFrame:
     today = datetime.today()
-    start = today - timedelta(days=years * 365 + 90)
+    start = (today - timedelta(days=years * 365 + 90)).strftime("%Y-%m-%d")
+    end   = today.strftime("%Y-%m-%d")
 
-    print(f"  金利データ: FRED から {start.strftime('%Y-%m-%d')} 〜 取得中...")
+    print(f"  金利データ: yfinance から {start} 〜 取得中...")
     frames: dict[str, pd.Series] = {}
-    for name, sid in FRED_YIELD_SERIES.items():
+    for name, ticker in YFINANCE_YIELD_TICKERS.items():
         try:
-            series = pdr.DataReader(sid, "fred", start, today)[sid].dropna()
+            series = _yf_download(ticker, start, end)
             if not series.empty:
                 frames[name] = series
-                print(f"    ✓ {name} ({sid}): {len(series)}件")
+                print(f"    ✓ {name} ({ticker}): {len(series)}件")
             else:
-                print(f"    - {name} ({sid}): データなし")
+                print(f"    - {name} ({ticker}): データなし")
         except Exception as e:
-            print(f"    Skip {name}({sid}): {e}", file=sys.stderr)
+            print(f"    Skip {name} ({ticker}): {e}", file=sys.stderr)
 
     if not frames:
         return pd.DataFrame()

@@ -95,23 +95,35 @@ def fetch_twitter(hours: int = 24) -> tuple[list[dict], list[dict]]:
                     "query":        query,
                     "max_results":  20,
                     "start_time":   since,
-                    "tweet.fields": "public_metrics,created_at,lang",
+                    "tweet.fields": "public_metrics,created_at,lang,author_id",
+                    "expansions":   "author_id",
+                    "user.fields":  "username,name",
                 },
                 timeout=15,
             )
             if resp.status_code == 200:
-                for t in resp.json().get("data", []):
+                body = resp.json()
+                # author_id → username マップを構築
+                user_map = {
+                    u["id"]: {"username": u.get("username", ""),
+                              "name":     u.get("name", "")}
+                    for u in body.get("includes", {}).get("users", [])
+                }
+                for t in body.get("data", []):
                     m = t.get("public_metrics", {})
                     eng = (m.get("like_count", 0)
                            + m.get("retweet_count", 0) * 2
                            + m.get("reply_count", 0))
+                    author = user_map.get(t.get("author_id", ""), {})
                     tweets.append({
-                        "id":       t["id"],
-                        "text":     t["text"],
-                        "eng":      eng,
-                        "likes":    m.get("like_count", 0),
-                        "retweets": m.get("retweet_count", 0),
-                        "lang":     lang,
+                        "id":          t["id"],
+                        "text":        t["text"],
+                        "eng":         eng,
+                        "likes":       m.get("like_count", 0),
+                        "retweets":    m.get("retweet_count", 0),
+                        "lang":        lang,
+                        "username":    author.get("username", ""),
+                        "name":        author.get("name", ""),
                     })
                 tweets.sort(key=lambda x: x["eng"], reverse=True)
                 print(f"  Twitter {lang.upper()}: {len(tweets)} 件")
@@ -170,18 +182,30 @@ def _esc(s: str) -> str:
 
 
 def tweet_card(t: dict, rank: int) -> str:
-    url  = f"https://x.com/i/web/status/{t['id']}"
-    lang = t.get("lang", "").upper()
-    bg   = "#fce4ec" if lang == "JA" else "#e3f2fd"
-    fg   = "#c62828" if lang == "JA" else "#1565c0"
-    tag  = (f"<span style='background:{bg};color:{fg};border-radius:3px;"
-            f"padding:1px 6px;font-size:10px;margin-right:6px;'>{lang}</span>"
-            ) if lang else ""
+    url      = f"https://x.com/i/web/status/{t['id']}"
+    lang     = t.get("lang", "").upper()
+    bg       = "#fce4ec" if lang == "JA" else "#e3f2fd"
+    fg       = "#c62828" if lang == "JA" else "#1565c0"
+    lang_tag = (f"<span style='background:{bg};color:{fg};border-radius:3px;"
+                f"padding:1px 6px;font-size:10px;margin-right:6px;'>{lang}</span>"
+                ) if lang else ""
+    username = t.get("username", "")
+    name     = t.get("name", "")
+    author_html = ""
+    if username:
+        profile_url = f"https://x.com/{username}"
+        author_html = (
+            f"<a href='{profile_url}' target='_blank' "
+            f"style='color:#555;text-decoration:none;font-weight:bold;'>"
+            f"{_esc(name)}</a>"
+            f"<span style='color:#aaa;margin-left:4px;'>@{_esc(username)}</span>"
+        )
     return f"""
 <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
-  <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
-    {tag}#{rank}&nbsp;&nbsp;♥{t['likes']:,}&nbsp;&nbsp;RT{t['retweets']:,}
+  <div style="font-size:11px;color:#aaa;margin-bottom:4px;">
+    {lang_tag}#{rank}&nbsp;&nbsp;♥{t['likes']:,}&nbsp;&nbsp;RT{t['retweets']:,}
   </div>
+  {"<div style='font-size:12px;margin-bottom:4px;'>" + author_html + "</div>" if author_html else ""}
   <div style="font-size:13px;line-height:1.65;color:#222;">{_esc(t['text'])}</div>
   <a href="{url}" target="_blank"
      style="font-size:11px;color:#1976d2;text-decoration:none;display:inline-block;margin-top:3px;">
@@ -356,7 +380,7 @@ def main():
 
         jp_rss, ov_rss = [], []
         if not (tw_ja or tw_en):
-            print("[1b] Twitter なし → RSS フォールバック...")
+            print("[1b] Twitter ツイート取得なし（レート制限または認証エラー）→ RSS フォールバック")
             jp_rss, ov_rss = fetch_rss(hours=hours_back)
 
         print("[2/3] HTML 生成中...")
