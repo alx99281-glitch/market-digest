@@ -252,16 +252,14 @@ def filter_product_tweets(tweets: list, top_n: int = 5) -> list[dict]:
     return matched[:top_n]
 
 
-def build_html(tw_ja: list, tw_en: list, jp_rss: list, ov_rss: list,
+def build_html(tw_ja: list, tw_en: list,
                date_str: str, time_label: str,
                since_str: str, now_str: str) -> str:
 
-    use_twitter = bool(tw_ja or tw_en)
-    icon_hdr    = "🌅" if "朝" in time_label else "🌆"
-    src_note    = "X (Twitter) · 直近24h" if use_twitter else "RSS（Reuters・CNBC・WSJ・NHK）"
-    sections    = []
+    icon_hdr = "🌅" if "朝" in time_label else "🌆"
+    sections = []
 
-    if use_twitter:
+    if tw_ja or tw_en:
         # 📈 投資商品 TOP5（JA+EN合算からキーワードフィルタ）
         product_tw = filter_product_tweets(
             sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
@@ -291,31 +289,25 @@ def build_html(tw_ja: list, tw_en: list, jp_rss: list, ov_rss: list,
             sections.append(section("🔥", "総合ランキング TOP10",
                                     "JA + EN 合算・エンゲージメント順", cards, "#b71c1c"))
 
-    else:
-        # RSS フォールバック
-        if jp_rss:
-            cards = "".join(rss_card(a, i) for i, a in enumerate(jp_rss[:5], 1))
-            sections.append(section("🗾", "日本のニュース", "最新順", cards, "#c62828"))
-        if ov_rss:
-            cards = "".join(rss_card(a, i) for i, a in enumerate(ov_rss[:5], 1))
-            sections.append(section("🌍", "海外のニュース", "最新順", cards, "#1565c0"))
-
-        # 全体TOP10（日本・海外交互）
-        merged, qi, qo = [], list(jp_rss[:5]), list(ov_rss[:5])
-        while qi or qo:
-            if qi: merged.append(qi.pop(0))
-            if qo: merged.append(qo.pop(0))
-        if merged:
-            cards = "".join(rss_card(a, i) for i, a in enumerate(merged[:10], 1))
-            sections.append(section("📰", "総合ニュース TOP10",
-                                    "日本・海外交互・最新順", cards, "#b71c1c"))
-
-    if not sections:
-        body_html = ("<p style='color:#aaa;font-size:13px;'>"
-                     "⚠️ データ取得に失敗しました。次回の配信をお待ちください。</p>")
-    else:
         body_html = "\n".join(sections)
+    else:
+        # ツイート取得失敗 — RSSには逃がさずエラーを明示
+        body_html = """
+        <div style="background:#fff3e0;border-left:4px solid #ff9800;
+                    padding:16px;border-radius:4px;margin-top:16px;">
+          <div style="font-size:14px;font-weight:bold;color:#e65100;margin-bottom:8px;">
+            ⚠️ X (Twitter) のツイートデータを取得できませんでした
+          </div>
+          <div style="font-size:13px;color:#555;line-height:1.7;">
+            考えられる原因:<br>
+            &nbsp;・Twitter API の月間レート制限に達した<br>
+            &nbsp;・Bearer Token の権限が不足（Basic プラン以上が必要）<br>
+            &nbsp;・Twitter API の一時的な障害<br><br>
+            次回の配信まで自動的に再試行します。
+          </div>
+        </div>"""
 
+    src_note = "X (Twitter) · 直近24h" if (tw_ja or tw_en) else "X (Twitter) · データ取得失敗"
     return f"""<!DOCTYPE html>
 <html lang="ja"><head>
 <meta charset="utf-8">
@@ -324,7 +316,7 @@ def build_html(tw_ja: list, tw_en: list, jp_rss: list, ov_rss: list,
 <body style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:640px;
              margin:0 auto;color:#333;font-size:14px;">
   <div style="background:#1a237e;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
-    <div style="font-size:20px;font-weight:bold;">{icon_hdr} 金融ダイジェスト</div>
+    <div style="font-size:20px;font-weight:bold;">{icon_hdr} 金融ツイートダイジェスト</div>
     <div style="font-size:12px;opacity:.85;margin-top:4px;">{date_str}　{time_label}</div>
     <div style="font-size:11px;opacity:.7;margin-top:3px;">
       集計期間: {since_str} 〜 {now_str} ／ {src_note}
@@ -378,21 +370,23 @@ def main():
         print("[1/3] Twitter 取得中（直近24h）...")
         tw_ja, tw_en = fetch_twitter(hours=hours_back)
 
-        jp_rss, ov_rss = [], []
-        if not (tw_ja or tw_en):
-            print("[1b] Twitter ツイート取得なし（レート制限または認証エラー）→ RSS フォールバック")
-            jp_rss, ov_rss = fetch_rss(hours=hours_back)
+        # RSSフォールバックは使わない。ツイートが取れない場合はメールにその旨を表示する。
 
         print("[2/3] HTML 生成中...")
-        html  = build_html(tw_ja, tw_en, jp_rss, ov_rss,
+        html  = build_html(tw_ja, tw_en,
                            date_str, time_label, since_str, now_str)
 
         # プレーンテキスト（スパムフィルタ対策）
+        all_tw = sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
         plain_lines = [subject, ""]
-        for t in (tw_ja + tw_en)[:10]:
-            plain_lines.append(f"♥{t['likes']} RT{t['retweets']}  {t['text'][:100]}")
-            plain_lines.append(f"https://x.com/i/web/status/{t['id']}")
-            plain_lines.append("")
+        if all_tw:
+            for t in all_tw[:10]:
+                who = f"@{t['username']} " if t.get("username") else ""
+                plain_lines.append(f"♥{t['likes']} RT{t['retweets']}  {who}{t['text'][:120]}")
+                plain_lines.append(f"https://x.com/i/web/status/{t['id']}")
+                plain_lines.append("")
+        else:
+            plain_lines.append("X (Twitter) のデータを取得できませんでした。")
         plain = "\n".join(plain_lines)
 
         print("[3/3] メール送信中...")
