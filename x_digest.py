@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-金融ツイートダイジェスト
+金融SNSダイジェスト (StockTwits版)
 
-直近24時間のエンゲージメント上位ツイートをそのまま表示する。
-  🗾 日本語ツイート TOP5
-  🌍 英語ツイート TOP5
-  🔥 全体 TOP10
+StockTwits の無料 API でトレンドメッセージを取得して表示する。
+認証不要・無料。
 
-Twitter Bearer Token 未設定時は RSS ニュースにフォールバック。
+  📈 注目の投資商品 TOP5
+  🗾 日本で話題 TOP5 (EWJ/NKY メッセージ ＋ RSS補完)
+  🌍 海外で話題 TOP5
+  🔥 総合ランキング TOP10
 """
 
 import os
@@ -23,155 +24,170 @@ import pytz
 import requests
 
 # ── 設定 ─────────────────────────────────────────────────
-GMAIL_USER           = os.environ.get("GMAIL_USER", "alx99281@gmail.com")
-GMAIL_APP_PASSWORD   = os.environ["GMAIL_APP_PASSWORD"]
-TWITTER_BEARER_TOKEN = os.environ.get("TWITTER_BEARER_TOKEN", "")
+GMAIL_USER         = os.environ.get("GMAIL_USER", "alx99281@gmail.com")
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; market-digest-bot/1.0)"}
+HEADERS  = {"User-Agent": "Mozilla/5.0 (compatible; market-digest-bot/1.0)"}
+ST_BASE  = "https://api.stocktwits.com/api/2"
 
-RSS_FEEDS = {
+# 投資商品キーワード（本文マッチ用）
+PRODUCT_KEYWORDS = [
+    # 個別株
+    "nvda", "nvidia", "tsla", "tesla", "aapl", "apple", "msft", "microsoft",
+    "amzn", "amazon", "meta", "googl", "google",
+    "amd", "arm", "smci", "intc", "intel",
+    # 半導体・テーマ
+    "dram", "hbm", "semiconductor", "chip", "ai stock",
+    # 指数・ETF
+    "spy", "qqq", "nasdaq", "dow", "s&p", "s&p500", "etf", "nikkei", "topix",
+    # 債券・金利
+    "treasury", "bond", "yield", "fed", "fomc",
+    # 為替
+    "usdjpy", "eurusd", "forex", "yen",
+    # コモディティ
+    "gold", "silver", "oil", "wti", "crude", "copper",
+    # 仮想通貨
+    "bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol",
+    # 不動産
+    "reit", "real estate",
+]
+
+# 日本関連シンボル（StockTwits）
+JP_SYMBOLS = ["EWJ", "DXJ", "NKY", "DBJP", "HEWJ"]
+
+# 人気シンボル（グローバル）
+POPULAR_SYMBOLS = [
+    "NVDA", "TSLA", "AAPL", "META", "MSFT", "GOOGL", "AMZN",
+    "SPY", "QQQ", "BTC.X", "ETH.X", "GLD", "TLT", "AMD",
+]
+
+# 日本語ニュース RSS（StockTwits JP が薄い場合の補完）
+JP_RSS_FEEDS = {
     "NHK経済":         "https://www.nhk.or.jp/rss/news/cat6.xml",
     "ロイター(日本語)": "https://jp.reuters.com/rssFeed/businessNews",
     "株探":             "https://kabutan.jp/rss/news.xml",
-    "Reuters(EN)":     "https://feeds.reuters.com/reuters/businessNews",
-    "CNBC":            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "WSJ Markets":     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "Yahoo Finance":   "https://finance.yahoo.com/news/rssindex",
 }
-RSS_JP = {"NHK経済", "ロイター(日本語)", "株探"}
-
-# 投資商品・ティッカー検出キーワード（大文字小文字不問）
-PRODUCT_KEYWORDS = [
-    # 個別株・ティッカー
-    "nvda", "nvidia", "tsla", "tesla", "aapl", "apple", "msft", "microsoft",
-    "amzn", "amazon", "meta", "googl", "google", "7203", "7974", "softbank",
-    "ソフトバンク", "トヨタ", "ソニー",
-    # 指数・ETF
-    "s&p", "s&p500", "spy", "qqq", "nasdaq", "dow", "日経", "nikkei", "topix",
-    "etf", "投資信託",
-    # 債券・金利
-    "10年債", "米国債", "treasury", "bond", "yield", "金利",
-    # 為替
-    "ドル円", "usdjpy", "eurusd", "ユーロ", "為替", "fx",
-    # コモディティ
-    "gold", "金価格", "原油", "oil", "wti", "copper", "銅",
-    # 仮想通貨
-    "bitcoin", "btc", "ethereum", "eth", "crypto", "仮想通貨", "ビットコイン",
-    # 不動産
-    "reit", "不動産", "マンション", "real estate",
-    # 投資手法
-    "レバレッジ", "空売り", "leverage", "short",
-]
 
 
-# ── Twitter 取得 ──────────────────────────────────────────
+# ── StockTwits 取得 ───────────────────────────────────────
 
-def fetch_twitter(hours: int = 24) -> tuple[list[dict], list[dict]]:
-    """直近 hours 時間の金融ツイートを取得。(ja, en) に分けて返す。"""
-    if not TWITTER_BEARER_TOKEN:
-        return [], []
+def _get(url: str, params: dict = None) -> dict | None:
+    """HTTP GET ヘルパー。失敗時は None。"""
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=12)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[WARN] {url} → HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[WARN] GET {url}: {e}")
+    return None
 
-    auth  = {"Authorization": f"Bearer {TWITTER_BEARER_TOKEN}"}
-    since = (datetime.now(timezone.utc) - timedelta(hours=hours)
-             ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    queries = {
-        "ja": ("(株 OR 日経 OR 為替 OR 金利 OR ETF OR 投資信託 OR 債券"
-               " OR 不動産 OR マンション OR REIT OR 仮想通貨 OR ビットコイン"
-               " OR レバレッジ OR 空売り) lang:ja -is:retweet -is:reply"),
-        "en": ("(stocks OR investing OR markets OR Fed OR SPX OR Nikkei"
-               " OR ETF OR bond OR forex OR crypto OR bitcoin OR realestate"
-               " OR earnings OR inflation) lang:en -is:retweet -is:reply"),
+def _parse_msg(raw: dict, category: str = "global") -> dict:
+    """StockTwits メッセージを内部形式に変換する。"""
+    u        = raw.get("user", {})
+    likes    = raw.get("likes", {}).get("total", 0)
+    reshares = raw.get("reshares", {}).get("reshared_count", 0)
+    eng      = likes + reshares * 2
+    symbols  = [s["symbol"] for s in raw.get("entities", {}).get("symbols", [])]
+    sent_raw = raw.get("entities", {}).get("sentiment") or {}
+    return {
+        "id":         raw["id"],
+        "text":       raw.get("body", ""),
+        "username":   u.get("username", ""),
+        "name":       u.get("name", u.get("username", "")),
+        "followers":  u.get("followers_count", 0),
+        "likes":      likes,
+        "reshares":   reshares,
+        "eng":        eng,
+        "symbols":    symbols,
+        "sentiment":  sent_raw.get("basic", ""),
+        "created_at": raw.get("created_at", ""),
+        "category":   category,
     }
 
-    results: dict[str, list] = {}
-    for lang, query in queries.items():
-        tweets = []
-        try:
-            resp = requests.get(
-                "https://api.twitter.com/2/tweets/search/recent",
-                headers=auth,
-                params={
-                    "query":        query,
-                    "max_results":  20,
-                    "start_time":   since,
-                    "tweet.fields": "public_metrics,created_at,lang,author_id",
-                    "expansions":   "author_id",
-                    "user.fields":  "username,name",
-                },
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                body = resp.json()
-                # author_id → username マップを構築
-                user_map = {
-                    u["id"]: {"username": u.get("username", ""),
-                              "name":     u.get("name", "")}
-                    for u in body.get("includes", {}).get("users", [])
-                }
-                for t in body.get("data", []):
-                    m = t.get("public_metrics", {})
-                    eng = (m.get("like_count", 0)
-                           + m.get("retweet_count", 0) * 2
-                           + m.get("reply_count", 0))
-                    author = user_map.get(t.get("author_id", ""), {})
-                    tweets.append({
-                        "id":          t["id"],
-                        "text":        t["text"],
-                        "eng":         eng,
-                        "likes":       m.get("like_count", 0),
-                        "retweets":    m.get("retweet_count", 0),
-                        "lang":        lang,
-                        "username":    author.get("username", ""),
-                        "name":        author.get("name", ""),
-                    })
-                tweets.sort(key=lambda x: x["eng"], reverse=True)
-                print(f"  Twitter {lang.upper()}: {len(tweets)} 件")
-            elif resp.status_code == 429:
-                print(f"[WARN] Twitter rate limit ({lang})")
-            else:
-                print(f"[WARN] Twitter {lang} {resp.status_code}: {resp.text[:120]}")
-        except Exception as e:
-            print(f"[WARN] Twitter {lang}: {e}")
-        results[lang] = tweets[:20]
-        time.sleep(1)
 
-    return results.get("ja", []), results.get("en", [])
+def fetch_stocktwits() -> tuple[list[dict], list[dict]]:
+    """
+    StockTwits からメッセージを取得し (global_msgs, jp_msgs) を返す。
+    global_msgs : トレンド + 人気シンボル合算
+    jp_msgs     : 日本関連シンボルのメッセージ
+    """
+    seen_ids: set[int] = set()
+    global_msgs: list[dict] = []
+    jp_msgs:     list[dict] = []
+
+    # ① トレンドストリーム（認証不要）
+    data = _get(f"{ST_BASE}/streams/trending.json")
+    if data:
+        for raw in data.get("messages", []):
+            m = _parse_msg(raw, "global")
+            if m["id"] not in seen_ids:
+                seen_ids.add(m["id"])
+                global_msgs.append(m)
+        print(f"  Trending: {len(global_msgs)} 件")
+    time.sleep(0.5)
+
+    # ② 人気シンボルのストリーム
+    for sym in POPULAR_SYMBOLS:
+        data = _get(f"{ST_BASE}/streams/symbol/{sym}.json")
+        if data:
+            for raw in data.get("messages", []):
+                m = _parse_msg(raw, "global")
+                if m["id"] not in seen_ids:
+                    seen_ids.add(m["id"])
+                    global_msgs.append(m)
+        time.sleep(0.3)
+
+    # ③ 日本関連シンボル
+    for sym in JP_SYMBOLS:
+        data = _get(f"{ST_BASE}/streams/symbol/{sym}.json")
+        if data:
+            for raw in data.get("messages", []):
+                m = _parse_msg(raw, "jp")
+                if m["id"] not in seen_ids:
+                    seen_ids.add(m["id"])
+                    jp_msgs.append(m)
+        time.sleep(0.3)
+
+    # エンゲージメント順ソート
+    global_msgs.sort(key=lambda x: x["eng"], reverse=True)
+    jp_msgs.sort(key=lambda x: x["eng"], reverse=True)
+    print(f"  StockTwits Global: {len(global_msgs)} / JP: {len(jp_msgs)} 件")
+    return global_msgs, jp_msgs
 
 
-# ── RSS フォールバック ─────────────────────────────────────
+# ── 日本語 RSS 補完 ──────────────────────────────────────
 
-def fetch_rss(hours: int = 24) -> tuple[list[dict], list[dict]]:
+def fetch_jp_rss(hours: int = 24) -> list[dict]:
+    """日本語RSSニュースを取得する（JP StockTwits 補完用）"""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    jp, ov = [], []
-    for source, url in RSS_FEEDS.items():
+    items  = []
+    for source, url in JP_RSS_FEEDS.items():
         try:
-            feed = feedparser.parse(url,
-                       request_headers={"User-Agent": "Mozilla/5.0"})
-            for e in feed.entries[:20]:
-                pub = e.get("published_parsed") or e.get("updated_parsed")
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            for e in feed.entries[:10]:
+                pub    = e.get("published_parsed") or e.get("updated_parsed")
                 pub_dt = datetime(*pub[:6], tzinfo=timezone.utc) if pub else None
                 if pub_dt and pub_dt < cutoff:
                     continue
-                item = {
+                items.append({
                     "source":  source,
                     "title":   e.get("title", "").strip(),
                     "summary": re.sub(r"<[^>]+>", "",
                                e.get("summary", e.get("description", ""))).strip()[:200],
                     "link":    e.get("link", ""),
                     "date":    pub_dt,
-                }
-                (jp if source in RSS_JP else ov).append(item)
+                })
         except Exception as ex:
             print(f"[WARN] RSS {source}: {ex}")
         time.sleep(0.2)
-
-    srt = lambda lst: sorted(
-        lst, key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True)
-    jp, ov = srt(jp)[:20], srt(ov)[:20]
-    print(f"  RSS JP:{len(jp)} OV:{len(ov)} 件")
-    return jp, ov
+    items.sort(
+        key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    print(f"  RSS JP: {len(items[:10])} 件")
+    return items[:10]
 
 
 # ── HTML パーツ ───────────────────────────────────────────
@@ -181,35 +197,49 @@ def _esc(s: str) -> str:
              .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def tweet_card(t: dict, rank: int) -> str:
-    url      = f"https://x.com/i/web/status/{t['id']}"
-    lang     = t.get("lang", "").upper()
-    bg       = "#fce4ec" if lang == "JA" else "#e3f2fd"
-    fg       = "#c62828" if lang == "JA" else "#1565c0"
-    lang_tag = (f"<span style='background:{bg};color:{fg};border-radius:3px;"
-                f"padding:1px 6px;font-size:10px;margin-right:6px;'>{lang}</span>"
-                ) if lang else ""
-    username = t.get("username", "")
-    name     = t.get("name", "")
+def st_card(m: dict, rank: int) -> str:
+    """StockTwits メッセージカード HTML"""
+    msg_url     = (f"https://stocktwits.com/{m['username']}/message/{m['id']}"
+                   if m.get("username") else "https://stocktwits.com")
+    profile_url = f"https://stocktwits.com/{m['username']}"
+
+    # センチメントバッジ
+    sent = m.get("sentiment", "")
+    if sent == "Bullish":
+        sent_html = ("<span style='background:#e8f5e9;color:#2e7d32;border-radius:3px;"
+                     "padding:1px 6px;font-size:10px;margin-right:5px;'>📈 Bullish</span>")
+    elif sent == "Bearish":
+        sent_html = ("<span style='background:#fce4ec;color:#c62828;border-radius:3px;"
+                     "padding:1px 6px;font-size:10px;margin-right:5px;'>📉 Bearish</span>")
+    else:
+        sent_html = ""
+
+    # シンボルタグ（最大4個）
+    sym_html = "".join(
+        f"<span style='background:#e3f2fd;color:#1565c0;border-radius:3px;"
+        f"padding:1px 5px;font-size:10px;margin-right:3px;'>${_esc(s)}</span>"
+        for s in m.get("symbols", [])[:4]
+    )
+
     author_html = ""
-    if username:
-        profile_url = f"https://x.com/{username}"
+    if m.get("username"):
         author_html = (
             f"<a href='{profile_url}' target='_blank' "
             f"style='color:#555;text-decoration:none;font-weight:bold;'>"
-            f"{_esc(name)}</a>"
-            f"<span style='color:#aaa;margin-left:4px;'>@{_esc(username)}</span>"
+            f"{_esc(m['name'])}</a>"
+            f"<span style='color:#aaa;margin-left:4px;'>@{_esc(m['username'])}</span>"
         )
+
     return f"""
 <div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
   <div style="font-size:11px;color:#aaa;margin-bottom:4px;">
-    {lang_tag}#{rank}&nbsp;&nbsp;♥{t['likes']:,}&nbsp;&nbsp;RT{t['retweets']:,}
+    {sent_html}{sym_html}#{rank}&nbsp;&nbsp;♥{m['likes']:,}&nbsp;&nbsp;🔁{m['reshares']:,}
   </div>
   {"<div style='font-size:12px;margin-bottom:4px;'>" + author_html + "</div>" if author_html else ""}
-  <div style="font-size:13px;line-height:1.65;color:#222;">{_esc(t['text'])}</div>
-  <a href="{url}" target="_blank"
+  <div style="font-size:13px;line-height:1.65;color:#222;">{_esc(m['text'])}</div>
+  <a href="{msg_url}" target="_blank"
      style="font-size:11px;color:#1976d2;text-decoration:none;display:inline-block;margin-top:3px;">
-    → X で見る ↗
+    → StockTwits で見る ↗
   </a>
 </div>"""
 
@@ -240,74 +270,84 @@ def section(icon: str, title: str, subtitle: str, cards_html: str,
             f"{cards_html}")
 
 
-def filter_product_tweets(tweets: list, top_n: int = 5) -> list[dict]:
-    """投資商品・ティッカーに言及しているツイートをエンゲージメント順で返す"""
-    matched = []
-    for t in tweets:
-        text_lower = t["text"].lower()
-        if any(kw in text_lower for kw in PRODUCT_KEYWORDS):
-            matched.append(t)
-    # エンゲージメント順（既にソート済みのはずだが念のため）
+def filter_product_msgs(msgs: list[dict], top_n: int = 5) -> list[dict]:
+    """投資商品・ティッカー言及メッセージをエンゲージメント順で返す"""
+    matched = [
+        m for m in msgs
+        if m.get("symbols")                                       # ティッカータグ付き
+        or any(kw in m["text"].lower() for kw in PRODUCT_KEYWORDS)
+    ]
     matched.sort(key=lambda x: x["eng"], reverse=True)
     return matched[:top_n]
 
 
-def build_html(tw_ja: list, tw_en: list,
+def build_html(global_msgs: list, jp_msgs: list, jp_rss: list,
                date_str: str, time_label: str,
                since_str: str, now_str: str) -> str:
 
     icon_hdr = "🌅" if "朝" in time_label else "🌆"
-    sections = []
+    has_data = bool(global_msgs or jp_msgs or jp_rss)
+    sections_html = []
 
-    if tw_ja or tw_en:
-        # 📈 投資商品 TOP5（JA+EN合算からキーワードフィルタ）
-        product_tw = filter_product_tweets(
-            sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
-        )
-        if product_tw:
-            cards = "".join(tweet_card(t, i) for i, t in enumerate(product_tw, 1))
-            sections.append(section("📈", "注目の投資商品",
-                                    "商品・ティッカー言及ツイート・エンゲージメント順",
-                                    cards, "#2e7d32"))
+    if has_data:
+        all_msgs = sorted(global_msgs + jp_msgs, key=lambda x: x["eng"], reverse=True)
 
-        # 🗾 日本語 TOP5
-        if tw_ja:
-            cards = "".join(tweet_card(t, i) for i, t in enumerate(tw_ja[:5], 1))
-            sections.append(section("🗾", "日本で話題", "日本語ツイート・エンゲージメント順",
-                                    cards, "#c62828"))
+        # 📈 注目の投資商品 TOP5
+        product_msgs = filter_product_msgs(all_msgs)
+        if product_msgs:
+            cards = "".join(st_card(m, i) for i, m in enumerate(product_msgs, 1))
+            sections_html.append(section(
+                "📈", "注目の投資商品",
+                "商品・ティッカー言及メッセージ · エンゲージメント順",
+                cards, "#2e7d32"))
 
-        # 🌍 英語 TOP5
-        if tw_en:
-            cards = "".join(tweet_card(t, i) for i, t in enumerate(tw_en[:5], 1))
-            sections.append(section("🌍", "海外で話題", "英語ツイート・エンゲージメント順",
-                                    cards, "#1565c0"))
+        # 🗾 日本で話題 TOP5
+        if jp_msgs:
+            cards = "".join(st_card(m, i) for i, m in enumerate(jp_msgs[:5], 1))
+            sections_html.append(section(
+                "🗾", "日本で話題",
+                "EWJ/NKY 関連メッセージ · エンゲージメント順",
+                cards, "#c62828"))
+        elif jp_rss:
+            # StockTwits の JP 投稿が少なければ RSS ニュースで補完
+            cards = "".join(rss_card(a, i) for i, a in enumerate(jp_rss[:5], 1))
+            sections_html.append(section(
+                "🗾", "日本で話題",
+                "日本語ニュース（RSS補完）· 新着順",
+                cards, "#c62828"))
 
-        # 🔥 全体 TOP10
-        all_tw = sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
-        if all_tw:
-            cards = "".join(tweet_card(t, i) for i, t in enumerate(all_tw[:10], 1))
-            sections.append(section("🔥", "総合ランキング TOP10",
-                                    "JA + EN 合算・エンゲージメント順", cards, "#b71c1c"))
+        # 🌍 海外で話題 TOP5
+        if global_msgs:
+            cards = "".join(st_card(m, i) for i, m in enumerate(global_msgs[:5], 1))
+            sections_html.append(section(
+                "🌍", "海外で話題",
+                "StockTwits トレンド · エンゲージメント順",
+                cards, "#1565c0"))
 
-        body_html = "\n".join(sections)
+        # 🔥 総合ランキング TOP10
+        if all_msgs:
+            cards = "".join(st_card(m, i) for i, m in enumerate(all_msgs[:10], 1))
+            sections_html.append(section(
+                "🔥", "総合ランキング TOP10",
+                "全メッセージ合算 · エンゲージメント順",
+                cards, "#b71c1c"))
+
+        body_html = "\n".join(sections_html)
+        src_note  = "StockTwits · 直近メッセージ"
     else:
-        # ツイート取得失敗 — RSSには逃がさずエラーを明示
         body_html = """
         <div style="background:#fff3e0;border-left:4px solid #ff9800;
                     padding:16px;border-radius:4px;margin-top:16px;">
           <div style="font-size:14px;font-weight:bold;color:#e65100;margin-bottom:8px;">
-            ⚠️ X (Twitter) のツイートデータを取得できませんでした
+            ⚠️ データを取得できませんでした
           </div>
           <div style="font-size:13px;color:#555;line-height:1.7;">
-            考えられる原因:<br>
-            &nbsp;・Twitter API の月間レート制限に達した<br>
-            &nbsp;・Bearer Token の権限が不足（Basic プラン以上が必要）<br>
-            &nbsp;・Twitter API の一時的な障害<br><br>
+            StockTwits API への接続に失敗しました。<br>
             次回の配信まで自動的に再試行します。
           </div>
         </div>"""
+        src_note = "StockTwits · データ取得失敗"
 
-    src_note = "X (Twitter) · 直近24h" if (tw_ja or tw_en) else "X (Twitter) · データ取得失敗"
     return f"""<!DOCTYPE html>
 <html lang="ja"><head>
 <meta charset="utf-8">
@@ -316,7 +356,7 @@ def build_html(tw_ja: list, tw_en: list,
 <body style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:640px;
              margin:0 auto;color:#333;font-size:14px;">
   <div style="background:#1a237e;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
-    <div style="font-size:20px;font-weight:bold;">{icon_hdr} 金融ツイートダイジェスト</div>
+    <div style="font-size:20px;font-weight:bold;">{icon_hdr} 金融SNSダイジェスト</div>
     <div style="font-size:12px;opacity:.85;margin-top:4px;">{date_str}　{time_label}</div>
     <div style="font-size:11px;opacity:.7;margin-top:3px;">
       集計期間: {since_str} 〜 {now_str} ／ {src_note}
@@ -336,10 +376,10 @@ def build_html(tw_ja: list, tw_en: list,
 # ── メール送信 ─────────────────────────────────────────────
 
 def send_email(subject: str, html_body: str, plain_body: str) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = GMAIL_USER
+    msg             = MIMEMultipart("alternative")
+    msg["Subject"]  = subject
+    msg["From"]     = GMAIL_USER
+    msg["To"]       = GMAIL_USER
     msg.attach(MIMEText(plain_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body,  "html",  "utf-8"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
@@ -367,26 +407,38 @@ def main():
     print(f"=== {subject} ===")
 
     try:
-        print("[1/3] Twitter 取得中（直近24h）...")
-        tw_ja, tw_en = fetch_twitter(hours=hours_back)
+        print("[1/3] StockTwits 取得中...")
+        global_msgs, jp_msgs = fetch_stocktwits()
 
-        # RSSフォールバックは使わない。ツイートが取れない場合はメールにその旨を表示する。
+        # JP StockTwits が少なければ RSS 補完
+        jp_rss: list[dict] = []
+        if len(jp_msgs) < 3:
+            print("[1b] 日本語 RSS 補完取得中...")
+            jp_rss = fetch_jp_rss(hours=hours_back)
 
         print("[2/3] HTML 生成中...")
-        html  = build_html(tw_ja, tw_en,
-                           date_str, time_label, since_str, now_str)
+        html = build_html(global_msgs, jp_msgs, jp_rss,
+                          date_str, time_label, since_str, now_str)
 
         # プレーンテキスト（スパムフィルタ対策）
-        all_tw = sorted(tw_ja + tw_en, key=lambda x: x["eng"], reverse=True)
+        all_msgs = sorted(global_msgs + jp_msgs, key=lambda x: x["eng"], reverse=True)
         plain_lines = [subject, ""]
-        if all_tw:
-            for t in all_tw[:10]:
-                who = f"@{t['username']} " if t.get("username") else ""
-                plain_lines.append(f"♥{t['likes']} RT{t['retweets']}  {who}{t['text'][:120]}")
-                plain_lines.append(f"https://x.com/i/web/status/{t['id']}")
+        if all_msgs:
+            for m in all_msgs[:10]:
+                syms = " ".join(f"${s}" for s in m.get("symbols", []))
+                plain_lines.append(
+                    f"♥{m['likes']} 🔁{m['reshares']}  @{m['username']}  {syms}")
+                plain_lines.append(m["text"][:150])
+                plain_lines.append(
+                    f"https://stocktwits.com/{m['username']}/message/{m['id']}")
+                plain_lines.append("")
+        elif jp_rss:
+            for a in jp_rss[:5]:
+                plain_lines.append(f"[{a['source']}] {a['title']}")
+                plain_lines.append(a.get("link", ""))
                 plain_lines.append("")
         else:
-            plain_lines.append("X (Twitter) のデータを取得できませんでした。")
+            plain_lines.append("データを取得できませんでした。")
         plain = "\n".join(plain_lines)
 
         print("[3/3] メール送信中...")
