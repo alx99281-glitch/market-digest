@@ -136,7 +136,8 @@ def load_prices(years: int = FETCH_YEARS, use_cache: bool = True) -> pd.DataFram
         return pd.DataFrame()
     df = pd.DataFrame(frames)
     df.index = pd.to_datetime(df.index)
-    return df.sort_index()
+    # yfinance は取引日のみ返すため資産間の日付ズレを前埋めで補完する
+    return df.sort_index().ffill()
 
 
 def load_yields(years: int = FETCH_YEARS, use_cache: bool = True) -> pd.DataFrame:

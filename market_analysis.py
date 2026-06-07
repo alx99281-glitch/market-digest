@@ -208,10 +208,10 @@ def build_regime_table(regime: dict) -> str:
             return "—"
         if is_price:
             color = "#2e7d32" if v > 0 else "#c62828"
-            sign  = "+" if v > 0 else "▲"
+            sign  = "+" if v > 0 else "-"
             return f"<span style='color:{color};font-weight:bold;'>{sign}{abs(v)*100:.1f}%</span>"
         else:
-            color = "#c62828" if v > 0 else "#2e7d32"
+            color = "#2e7d32" if v > 0 else "#c62828"
             return f"<span style='color:{color};'>{v:+.2f}%</span>"
 
     # Feature order: price assets first, then yields
