@@ -2,7 +2,7 @@
 """
 マーケット分析メール
 ・市場レジーム分析（金利・為替・株式の局面比較）
-・日経平均チャートパターン分析
+・日経平均チャートパターン分析（SVG）
 を毎朝 6:00 SGT にメール送信する
 """
 
@@ -24,6 +24,7 @@ GROQ_API_KEY       = os.environ["GROQ_API_KEY"]
 GMAIL_USER         = os.environ.get("GMAIL_USER", "alx99281@gmail.com")
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 
+
 # ── 局面分析 ──────────────────────────────────────────
 def run_regime_analysis() -> dict | None:
     try:
@@ -35,10 +36,11 @@ def run_regime_analysis() -> dict | None:
             compute_forward_returns, period_label, ALL_ASSETS, normalize_all,
         )
 
-        WINDOW = 21
-        YEARS  = 15
-        STEP   = 5
-        TOP_N  = 10
+        WINDOW    = 63   # 3ヶ月（マクロ局面の特徴づけに適切）
+        FWD_DAYS  = 5    # 類似局面後1週間
+        YEARS     = 20
+        STEP      = 5
+        TOP_N     = 10
 
         print("  [局面] 価格データ取得中...")
         prices = load_prices(YEARS, use_cache=False)
@@ -64,66 +66,64 @@ def run_regime_analysis() -> dict | None:
             return None
 
         hist_norm, current_norm = normalize_all(hist_raw, current_raw)
+        # 直近3ウィンドウは除外（ルックアヘッドバイアス防止）
         cutoff    = current_date - pd.Timedelta(days=WINDOW * 3)
         hist_filt = hist_norm[hist_norm.index <= cutoff]
         similar   = find_similar(current_norm, hist_filt, top_n=TOP_N)
         if similar.empty:
             return None
 
-        fwd_rets = compute_forward_returns(prices, similar["date"].tolist(), WINDOW)
+        # 類似局面トップ1のみ使用
+        row       = similar.iloc[0]
+        sim_date  = row["date"]
+        lbl       = period_label(sim_date)
+        raw_feat  = feat_records.get(sim_date)
 
-        outperform, underperform = [], []
-        if not fwd_rets.empty:
-            mean_ret = fwd_rets.mean() * 100
-            hit_rate = (fwd_rets > 0).mean() * 100
-            m_n   = (mean_ret - mean_ret.mean()) / (mean_ret.std() + 1e-9)
-            h_n   = (hit_rate  - hit_rate.mean()) / (hit_rate.std()  + 1e-9)
-            score = (m_n * 0.6 + h_n * 0.4).sort_values(ascending=False)
-            for asset in score.head(3).index:
-                outperform.append({"asset": asset,
-                                   "avg": round(float(mean_ret[asset]), 1),
-                                   "hit": round(float(hit_rate[asset]))})
-            for asset in score.tail(3).index:
-                underperform.append({"asset": asset,
-                                     "avg": round(float(mean_ret[asset]), 1),
-                                     "hit": round(float(hit_rate[asset]))})
+        # 類似局面のその後5日（1週間）リターン
+        fwd_single = compute_forward_returns(prices, [sim_date], FWD_DAYS)
+        fwd_5d: dict = {}
+        if not fwd_single.empty:
+            ret_row = fwd_single.iloc[0]
+            for asset in ALL_ASSETS:
+                if asset in ret_row.index:
+                    v = float(ret_row[asset])
+                    if not import_numpy_isnan(v):
+                        fwd_5d[asset] = round(v * 100, 1)
+        # 金利の1週間変化も含める
+        yield_fwd = compute_forward_returns(
+            yields.reindex(prices.index, method="ffill") if not yields.empty else pd.DataFrame(),
+            [sim_date], FWD_DAYS
+        ) if not yields.empty else pd.DataFrame()
+        if not yield_fwd.empty:
+            ret_row = yield_fwd.iloc[0]
+            for col in ret_row.index:
+                v = float(ret_row[col])
+                if not import_numpy_isnan(v):
+                    fwd_5d[col] = round(v, 4)  # yield は pp変化なので生の値
 
-        top2 = []
-        for _, row in similar.head(2).iterrows():
-            date     = row["date"]
-            lbl      = period_label(date)
-            raw_feat = feat_records.get(date)
-
-            fwd_single = compute_forward_returns(prices, [date], WINDOW)
-            fwd_dict: dict = {}
-            if not fwd_single.empty:
-                ret_row = fwd_single.iloc[0]
-                for asset in ALL_ASSETS:
-                    if asset in ret_row.index:
-                        v = float(ret_row[asset])
-                        if not np.isnan(v):
-                            fwd_dict[asset] = round(v * 100, 1)
-
-            top2.append({
-                "date":            date.strftime("%Y-%m-%d"),
-                "similarity":      round(float(row["similarity"]), 4),
-                "label":           lbl,
-                "features":        {k: round(float(v), 4)
-                                    for k, v in raw_feat.items()
-                                    if not np.isnan(float(v))} if raw_feat is not None else {},
-                "forward_returns": fwd_dict,
-            })
+        top1 = {
+            "date":          sim_date.strftime("%Y-%m-%d"),
+            "similarity":    round(float(row["similarity"]), 4),
+            "label":         lbl,
+            "features":      {k: round(float(v), 4)
+                              for k, v in raw_feat.items()
+                              if not import_numpy_isnan(float(v))} if raw_feat is not None else {},
+            "forward_5d":    fwd_5d,
+        }
 
         price_snap = {k: round(float(v), 4) for k, v in current_raw.items()
-                      if k in ALL_ASSETS and not np.isnan(float(v))}
+                      if k in ALL_ASSETS and not import_numpy_isnan(float(v))}
         yield_snap = {k: round(float(v), 4) for k, v in current_raw.items()
-                      if k not in ALL_ASSETS and not np.isnan(float(v))}
+                      if k not in ALL_ASSETS and not import_numpy_isnan(float(v))}
 
-        print(f"  [局面] 完了 — 類似局面 {len(top2)} 件取得")
+        print(f"  [局面] 完了 — 類似局面: {top1['date']} ({top1['similarity']:.1%})")
         return {
-            "top2": top2, "outperform": outperform, "underperform": underperform,
-            "price_snap": price_snap, "yield_snap": yield_snap,
-            "current_date": current_date.strftime("%Y-%m-%d"), "window": WINDOW,
+            "top1":         top1,
+            "price_snap":   price_snap,
+            "yield_snap":   yield_snap,
+            "current_date": current_date.strftime("%Y-%m-%d"),
+            "window":       WINDOW,
+            "fwd_window":   FWD_DAYS,
         }
 
     except Exception as e:
@@ -132,8 +132,17 @@ def run_regime_analysis() -> dict | None:
         return None
 
 
+def import_numpy_isnan(v):
+    import math
+    try:
+        return math.isnan(float(v))
+    except Exception:
+        return True
+
+
 def explain_regime(regime: dict) -> str:
     client = Groq(api_key=GROQ_API_KEY)
+    top1   = regime["top1"]
 
     def fmt_price(d):
         return "\n".join(f"  {k}: {'+' if v>0 else '-'}{abs(v)*100:.1f}%"
@@ -143,25 +152,23 @@ def explain_regime(regime: dict) -> str:
         return "\n".join(f"  {k}: {v:+.2f}%"
                          for k, v in sorted(d.items(), key=lambda x: abs(x[1]), reverse=True))
 
-    similar_text = ""
-    for i, p in enumerate(regime["top2"], 1):
-        lbl = f"[{p['label']}]" if p["label"] else "[ラベルなし]"
-        similar_text += f"\n類似局面{i}: {p['date']} {lbl}  類似度: {p['similarity']:.2%}\n"
-        price_f = {k: v for k, v in p["features"].items() if k in regime["price_snap"]}
-        yield_f = {k: v for k, v in p["features"].items() if k in regime["yield_snap"]}
-        for k, v in sorted(price_f.items(), key=lambda x: abs(x[1]), reverse=True)[:6]:
-            similar_text += f"  {k}: {'+' if v>0 else '-'}{abs(v)*100:.1f}%\n"
-        for k, v in sorted(yield_f.items(), key=lambda x: abs(x[1]), reverse=True)[:3]:
-            similar_text += f"  {k}: {v:+.2f}%\n"
-        fwd = p.get("forward_returns", {})
-        if fwd:
-            fwd_str = "  ".join(
-                f"{k}: {'+' if v>=0 else ''}{v:.1f}%"
-                for k, v in sorted(fwd.items(), key=lambda x: abs(x[1]), reverse=True)
-            )
-            similar_text += f"  ↓翌{regime['window']}日実績: {fwd_str}\n"
+    lbl = f"[{top1['label']}]" if top1["label"] else ""
+    price_f = {k: v for k, v in top1["features"].items() if k in regime["price_snap"]}
+    yield_f = {k: v for k, v in top1["features"].items() if k in regime["yield_snap"]}
 
-    prompt = f"""あなたはプロのマーケットアナリストです。以下の情報をもとに日本語で分析してください。
+    feat_str = ""
+    for k, v in sorted(price_f.items(), key=lambda x: abs(x[1]), reverse=True)[:6]:
+        feat_str += f"  {k}: {'+' if v>0 else '-'}{abs(v)*100:.1f}%\n"
+    for k, v in sorted(yield_f.items(), key=lambda x: abs(x[1]), reverse=True)[:3]:
+        feat_str += f"  {k}: {v:+.2f}%\n"
+
+    fwd = top1.get("forward_5d", {})
+    fwd_str = "  ".join(
+        f"{k}: {'+' if v>=0 else ''}{v:.1f}%"
+        for k, v in sorted(fwd.items(), key=lambda x: abs(x[1]), reverse=True)
+    ) if fwd else "データなし"
+
+    prompt = f"""あなたはプロのマーケットアナリストです。以下の情報をもとに日本語で簡潔に分析してください。
 
 【現在の市場動向】({regime['current_date']} 基準、直近{regime['window']}営業日)
 価格変動:
@@ -169,80 +176,115 @@ def explain_regime(regime: dict) -> str:
 金利変動:
 {fmt_yield(regime['yield_snap'])}
 
-【過去の類似局面トップ2（コサイン類似度）】
-{similar_text}
+【最も類似した過去局面】
+{top1['date']} {lbl}  類似度: {top1['similarity']:.1%}
+当時の動き:
+{feat_str}
+翌1週間実績: {fwd_str}
 
-以下の形式で、簡潔に出力してください：
+以下の形式で出力してください：
 
-## 類似局面①: [日付] [局面名]
-- 現在と似ている点を2〜3点（箇条書き、数値は表を参照するため不要）
-- その後の特徴的な動き（翌月実績から読み取れること）
-
-## 類似局面②: [日付] [局面名]
-- 同上
+## 類似局面: {top1['date']} {lbl}
+- 現在と似ている点を2〜3点（箇条書き）
+- 当時のその後の特徴的な動き
 
 ## 今回の示唆
-- 2局面の共通点・相違点から読み取れる今後の注目ポイントを2〜3点
+- 上記を踏まえた今後1〜2週間の注目ポイントを2〜3点
 """
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2048,
+        max_tokens=1024,
     )
     return response.choices[0].message.content
 
 
-# ── 局面比較テーブル生成 ──────────────────────────────
+# ── 統合テーブル生成 ──────────────────────────────────
 def build_regime_table(regime: dict) -> str:
-    import numpy as np
-    top2       = regime["top2"]
+    """
+    1本のテーブルで表示:
+    資産 | 現在（直近N日）| 類似局面①当時 | 類似局面①その後5日
+    """
+    top1       = regime["top1"]
     price_snap = regime["price_snap"]
     yield_snap = regime["yield_snap"]
+    fwd_5d     = top1.get("forward_5d", {})
+    fwd_days   = regime.get("fwd_window", 5)
+    window     = regime["window"]
 
-    def fmt(val, is_price):
+    def fmt_price(v):
+        if v is None:
+            return "<span style='color:#ccc;'>—</span>"
+        try:
+            v = float(v)
+        except Exception:
+            return "<span style='color:#ccc;'>—</span>"
+        color = "#2e7d32" if v > 0 else "#c62828"
+        sign  = "+" if v > 0 else "-"
+        return f"<span style='color:{color};font-weight:bold;'>{sign}{abs(v)*100:.1f}%</span>"
+
+    def fmt_yield(v):
+        if v is None:
+            return "<span style='color:#ccc;'>—</span>"
+        try:
+            v = float(v)
+        except Exception:
+            return "<span style='color:#ccc;'>—</span>"
+        color = "#2e7d32" if v > 0 else "#c62828"
+        return f"<span style='color:{color};'>{v:+.2f}%</span>"
+
+    def fmt_fwd(key, val):
         if val is None:
-            return "—"
+            return "<span style='color:#ccc;'>—</span>"
         try:
             v = float(val)
         except Exception:
-            return "—"
-        if is_price:
-            color = "#2e7d32" if v > 0 else "#c62828"
-            sign  = "+" if v > 0 else "-"
-            return f"<span style='color:{color};font-weight:bold;'>{sign}{abs(v)*100:.1f}%</span>"
+            return "<span style='color:#ccc;'>—</span>"
+        is_yield = key in regime["yield_snap"]
+        color = "#2e7d32" if v > 0 else "#c62828"
+        if is_yield:
+            return f"<span style='color:{color};'>{v:+.4f}%</span>"
         else:
-            color = "#2e7d32" if v > 0 else "#c62828"
-            return f"<span style='color:{color};'>{v:+.2f}%</span>"
+            sign = "+" if v > 0 else "-"
+            return f"<span style='color:{color};font-weight:bold;'>{sign}{abs(v):.1f}%</span>"
 
-    # Feature order: price assets first, then yields
+    # 価格系列（変化の大きい順）+ 金利系列
     price_keys = sorted(price_snap.keys(), key=lambda k: -abs(price_snap[k]))
     yield_keys = sorted(yield_snap.keys(), key=lambda k: -abs(yield_snap[k]))
     all_keys   = price_keys + yield_keys
 
-    h1  = f"{top2[0]['date'][:7]}<br><small style='color:#888;'>{top2[0]['label'] or ''}</small>" if top2 else ""
-    h2  = f"{top2[1]['date'][:7]}<br><small style='color:#888;'>{top2[1]['label'] or ''}</small>" if len(top2) > 1 else ""
-
     rows = ""
-    for k in all_keys:
+    for i, k in enumerate(all_keys):
         is_price = k in price_snap
-        cur = price_snap.get(k) or yield_snap.get(k)
-        v1  = top2[0]["features"].get(k) if top2 else None
-        v2  = top2[1]["features"].get(k) if len(top2) > 1 else None
-        bg  = "#fff" if all_keys.index(k) % 2 == 0 else "#fafafa"
-        rows += (f"<tr style='background:{bg};'>"
-                 f"<td style='padding:5px 8px;font-size:12px;font-weight:bold;'>{k}</td>"
-                 f"<td style='padding:5px 8px;font-size:12px;text-align:center;'>{fmt(v1, is_price)}</td>"
-                 f"<td style='padding:5px 8px;font-size:12px;text-align:center;'>{fmt(v2, is_price)}</td>"
-                 f"<td style='padding:5px 8px;font-size:12px;text-align:center;'>{fmt(cur, is_price)}</td>"
-                 f"</tr>")
+        cur      = price_snap.get(k) or yield_snap.get(k)
+        past     = top1["features"].get(k)
+        fwd_val  = fwd_5d.get(k)
+        bg       = "#fff" if i % 2 == 0 else "#fafafa"
+        rows += (
+            f"<tr style='background:{bg};'>"
+            f"<td style='padding:5px 8px;font-size:12px;font-weight:bold;'>{k}</td>"
+            f"<td style='padding:5px 8px;font-size:12px;text-align:center;background:#fffde7;'>"
+            f"{fmt_price(cur) if is_price else fmt_yield(cur)}</td>"
+            f"<td style='padding:5px 8px;font-size:12px;text-align:center;'>"
+            f"{fmt_price(past) if is_price else fmt_yield(past)}</td>"
+            f"<td style='padding:5px 8px;font-size:12px;text-align:center;background:#f1f8e9;'>"
+            f"{fmt_fwd(k, fwd_val)}</td>"
+            f"</tr>"
+        )
 
-    return f"""<table style='width:100%;border-collapse:collapse;margin-top:10px;'>
+    sim_lbl = top1["label"] or ""
+    sim_hdr = f"{top1['date'][:7]}<br><small style='color:#888;font-weight:normal;'>{sim_lbl}</small>"
+
+    return f"""<table style='width:100%;border-collapse:collapse;margin-top:10px;font-family:sans-serif;'>
   <thead>
-    <tr style='background:#fce4ec;'>
-      <th style='padding:6px 8px;font-size:12px;text-align:left;'>特徴量</th>
-      <th style='padding:6px 8px;font-size:12px;text-align:center;'>類似局面①<br>{h1}</th>
-      <th style='padding:6px 8px;font-size:12px;text-align:center;'>類似局面②<br>{h2}</th>
-      <th style='padding:6px 8px;font-size:12px;text-align:center;background:#fff3e0;'>現在</th>
+    <tr style='background:#eceff1;'>
+      <th style='padding:6px 8px;font-size:11px;text-align:left;'>資産</th>
+      <th style='padding:6px 8px;font-size:11px;text-align:center;background:#fff8e1;'>
+        現在<br><small style='color:#888;font-weight:normal;'>直近{window}日</small></th>
+      <th style='padding:6px 8px;font-size:11px;text-align:center;'>
+        類似局面①<br><small style='color:#888;font-weight:normal;'>{sim_hdr}</small></th>
+      <th style='padding:6px 8px;font-size:11px;text-align:center;background:#f1f8e9;'>
+        その後{fwd_days}日間<br><small style='color:#888;font-weight:normal;'>（類似局面①翌1週間）</small></th>
     </tr>
   </thead>
   <tbody>{rows}</tbody>
@@ -250,7 +292,7 @@ def build_regime_table(regime: dict) -> str:
 
 
 # ── チャートパターン分析 ──────────────────────────────
-def run_pattern_analysis(window_days: int = 42, forward_days: int = 21,
+def run_pattern_analysis(window_days: int = 63, forward_days: int = 21,
                          top_n: int = 5) -> dict | None:
     try:
         import numpy as np
@@ -260,10 +302,9 @@ def run_pattern_analysis(window_days: int = 42, forward_days: int = 21,
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from market_regime import load_prices
 
-        print("  [パターン] 日経平均データ読み込み中 (Excel + 差分取得)...")
+        print("  [パターン] 日経平均データ読み込み中...")
         prices = load_prices()
         if prices.empty or "NKY" not in prices.columns:
-            print("  [パターン] NKYデータなし")
             return None
         nky  = prices["NKY"].dropna().sort_index()
         nky.index = pd.to_datetime(nky.index)
@@ -285,8 +326,8 @@ def run_pattern_analysis(window_days: int = 42, forward_days: int = 21,
         all_norm = (all_wins - means) / stds
         corrs    = (all_norm @ current_norm) / window_days
 
-        cutoff = len(corrs) - forward_days - 5
-        corrs  = corrs[:cutoff]
+        cutoff  = len(corrs) - forward_days - 5
+        corrs   = corrs[:cutoff]
         top_idx = np.argsort(corrs)[::-1]
 
         results, used = [], []
@@ -302,14 +343,13 @@ def run_pattern_analysis(window_days: int = 42, forward_days: int = 21,
             base     = vals[end_idx]
             fwd_rets = ((fwd_vals - base) / base * 100).tolist() if base != 0 else []
 
-            base = vals[idx] if vals[idx] != 0 else 1.0
-            hist_indexed = (vals[idx: idx + window_days] / base * 100).tolist()
-            fwd_indexed  = (vals[idx + window_days: idx + window_days + forward_days] / base * 100).tolist()
+            base_s        = vals[idx] if vals[idx] != 0 else 1.0
+            hist_indexed  = (vals[idx: idx + window_days] / base_s * 100).tolist()
+            fwd_indexed   = (vals[idx + window_days: idx + window_days + forward_days] / base_s * 100).tolist()
             results.append({
                 "start_date":      nky.index[idx].strftime("%Y-%m-%d"),
                 "end_date":        nky.index[end_idx].strftime("%Y-%m-%d"),
                 "corr":            round(float(corrs[idx]), 4),
-                "pattern_norm":    znorm(vals[idx: idx + window_days]).tolist(),
                 "forward_returns": fwd_rets,
                 "forward_final":   round(float(fwd_rets[-1]), 2) if fwd_rets else None,
                 "pattern_indexed": hist_indexed,
@@ -323,7 +363,6 @@ def run_pattern_analysis(window_days: int = 42, forward_days: int = 21,
         finals = [r["forward_final"] for r in results if r["forward_final"] is not None]
         print(f"  [パターン] 完了 — 類似局面 {len(results)} 件")
         return {
-            "current_norm":          znorm(vals[-window_days:]).tolist(),
             "current_indexed":       (vals[-window_days:] / cur_base * 100).tolist(),
             "current_start":         nky.index[-window_days].strftime("%Y-%m-%d"),
             "current_end":           nky.index[-1].strftime("%Y-%m-%d"),
@@ -340,75 +379,133 @@ def run_pattern_analysis(window_days: int = 42, forward_days: int = 21,
         return None
 
 
-# ── チャート生成 ──────────────────────────────────────
-def build_pattern_chart(data: dict) -> str:
-    import base64
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+# ── SVGチャート生成（携帯対応） ───────────────────────
+def build_pattern_svg(data: dict) -> str:
+    """日経平均パターン分析をインラインSVGで描画。画像不使用のため携帯メールで確実表示。"""
     import numpy as np
 
-    plt.rcParams["font.family"]        = ["Noto Sans CJK JP", "DejaVu Sans"]
-    plt.rcParams["axes.unicode_minus"] = False
+    W, H = 560, 210
+    ML, MR, MT, MB = 50, 12, 28, 40
+    pw = W - ML - MR
+    ph = H - MT - MB
 
-    fig, ax = plt.subplots(figsize=(10, 5), facecolor="white")
+    cur  = np.array(data.get("current_indexed", []), dtype=float)
+    top1 = data["top_similar"][0] if data["top_similar"] else None
 
-    window_days  = data["window_days"]
-    forward_days = data["forward_days"]
+    if cur.size == 0:
+        return ""
 
-    # 現在チャート（実価格インデックス）
-    cur_idx = np.array(data.get("current_indexed", []))
-    if cur_idx.size:
-        x_cur = np.arange(len(cur_idx))
-        ax.plot(x_cur, cur_idx, color="#1565C0", linewidth=2.8, zorder=5,
-                label=f"現在  ({data['current_start']} 〜 {data['current_end']})")
+    fwd_days = data.get("forward_days", 21)
+    win_days = data.get("window_days", 63)
 
-    # トップ1類似局面（マッチ窓 + 翌1ヶ月）
-    if data["top_similar"]:
-        top1 = data["top_similar"][0]
-        patt = np.array(top1.get("pattern_indexed", []))
-        fwd  = np.array(top1.get("forward_indexed", []))
-        lbl  = top1["start_date"][:7]
+    all_y = list(cur)
+    if top1:
+        all_y.extend(top1.get("pattern_indexed", []))
+        all_y.extend(top1.get("forward_indexed", []))
+    all_y = [y for y in all_y if not np.isnan(float(y))]
+    if not all_y:
+        return ""
+
+    y_min = min(all_y) * 0.997
+    y_max = max(all_y) * 1.003
+    total_x = win_days + fwd_days
+
+    def sx(i):
+        return ML + (i / max(total_x - 1, 1)) * pw
+
+    def sy(v):
+        return MT + (1 - (v - y_min) / max(y_max - y_min, 1e-6)) * ph
+
+    def to_path(pts, x_offset=0):
+        valid = [(i, float(v)) for i, v in enumerate(pts) if not np.isnan(float(v))]
+        if not valid:
+            return ""
+        parts = [f"M {sx(valid[0][0]+x_offset):.1f},{sy(valid[0][1]):.1f}"]
+        for i, v in valid[1:]:
+            parts.append(f"L {sx(i+x_offset):.1f},{sy(v):.1f}")
+        return " ".join(parts)
+
+    elems = []
+
+    # グリッド・Y軸ラベル
+    for i in range(5):
+        yv  = y_min + (y_max - y_min) * i / 4
+        yp  = sy(yv)
+        elems.append(f'<line x1="{ML}" y1="{yp:.1f}" x2="{W-MR}" y2="{yp:.1f}" '
+                     f'stroke="#f0f0f0" stroke-width="1"/>')
+        elems.append(f'<text x="{ML-4}" y="{yp+4:.1f}" text-anchor="end" '
+                     f'font-size="9" fill="#aaa">{yv:.0f}</text>')
+
+    # ベースライン100
+    if y_min < 100 < y_max:
+        y100 = sy(100)
+        elems.append(f'<line x1="{ML}" y1="{y100:.1f}" x2="{W-MR}" y2="{y100:.1f}" '
+                     f'stroke="#ddd" stroke-width="1" stroke-dasharray="3,2"/>')
+
+    # 「今日」縦線
+    tx = sx(win_days - 1)
+    elems.append(f'<line x1="{tx:.1f}" y1="{MT}" x2="{tx:.1f}" y2="{H-MB}" '
+                 f'stroke="#bbb" stroke-width="1" stroke-dasharray="3,2"/>')
+    elems.append(f'<text x="{tx:.1f}" y="{H-MB+11}" text-anchor="middle" '
+                 f'font-size="8" fill="#999">今日</text>')
+
+    # 類似局面①（赤・実線）＋ その後（赤・破線）
+    if top1:
+        patt = top1.get("pattern_indexed", [])
+        fwdv = top1.get("forward_indexed", [])
         ff   = top1.get("forward_final")
-        ff_str = f"  翌{forward_days}日: {ff:+.1f}%" if ff is not None else ""
+        if patt:
+            d = to_path(patt)
+            if d:
+                elems.append(f'<path d="{d}" stroke="#E53935" stroke-width="2.2" '
+                             f'fill="none" opacity="0.75"/>')
+        if fwdv and patt:
+            join = [patt[-1]] + list(fwdv)
+            d = to_path(join, x_offset=len(patt)-1)
+            if d:
+                elems.append(f'<path d="{d}" stroke="#E53935" stroke-width="1.8" '
+                             f'fill="none" stroke-dasharray="5,3" opacity="0.7"/>')
 
-        if patt.size:
-            x_p = np.arange(len(patt))
-            ax.plot(x_p, patt, color="#E53935", linewidth=2.2,
-                    label=f"類似①  {lbl}  (r={top1['corr']:.3f}){ff_str}")
-        if fwd.size and patt.size:
-            # 接続点を含めて破線で描画
-            join  = np.concatenate([[patt[-1]], fwd])
-            x_fwd = np.arange(len(patt) - 1, len(patt) + len(fwd))
-            ax.plot(x_fwd, join, color="#E53935", linewidth=2.0,
-                    linestyle="--", label=f"類似①その後 {forward_days}営業日（点線）")
+    # 現在（青・実線・前面）
+    if cur.size:
+        d = to_path(cur.tolist())
+        if d:
+            elems.append(f'<path d="{d}" stroke="#1565C0" stroke-width="2.5" fill="none"/>')
 
-    # 現在の末端（"今日"）を縦線で示す
-    ax.axvline(x=window_days - 1, color="#555", linewidth=1.0,
-               linestyle=":", alpha=0.6, label="今日")
-    ax.axhline(y=100, color="#aaa", linewidth=0.6, linestyle="--", alpha=0.5)
-
+    # タイトル
     avg_r = data.get("avg_forward_return")
-    med_r = data.get("median_forward_return")
-    sub = ""
+    title = f"日経平均 現在 vs 類似局面TOP1（インデックス 期初=100）"
     if avg_r is not None:
-        sub = f"  （類似局面 {len(data['top_similar'])} 件の翌{forward_days}日平均 {avg_r:+.1f}%  中央値 {med_r:+.1f}%）"
+        n = len(data["top_similar"])
+        title += f"  上位{n}局面 翌{fwd_days}日平均 {avg_r:+.1f}%"
+    elems.append(f'<text x="{ML+pw//2}" y="{MT-10}" text-anchor="middle" '
+                 f'font-size="9" font-weight="bold" fill="#444">{title}</text>')
 
-    ax.set_title(
-        f"日経平均 現在 vs 類似局面トップ1  ―  インデックス（期初=100）{sub}",
-        fontsize=9)
-    ax.set_xlabel("営業日数", fontsize=8)
-    ax.set_ylabel("インデックス（期初=100）", fontsize=8)
-    ax.legend(fontsize=8, loc="best", framealpha=0.85)
-    ax.grid(True, alpha=0.2)
+    # 凡例
+    legy = H - 8
+    elems.append(f'<line x1="{ML}" y1="{legy}" x2="{ML+16}" y2="{legy}" '
+                 f'stroke="#1565C0" stroke-width="2.5"/>')
+    cs = data.get("current_start", "")
+    ce = data.get("current_end", "")
+    elems.append(f'<text x="{ML+20}" y="{legy+4}" font-size="9" fill="#555">'
+                 f'現在 {cs}〜{ce}</text>')
 
-    plt.tight_layout()
-    buf = _io.BytesIO()
-    plt.savefig(buf, format="jpeg", dpi=90, bbox_inches="tight",
-                pil_kwargs={"quality": 80, "optimize": True})
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode()
+    if top1:
+        lx2 = ML + 220
+        ff  = top1.get("forward_final")
+        ffs = f" 翌{fwd_days}日:{ff:+.1f}%" if ff is not None else ""
+        elems.append(f'<line x1="{lx2}" y1="{legy}" x2="{lx2+16}" y2="{legy}" '
+                     f'stroke="#E53935" stroke-width="2"/>')
+        elems.append(f'<text x="{lx2+20}" y="{legy+4}" font-size="9" fill="#555">'
+                     f'類似① {top1["start_date"][:7]}{ffs}</text>')
+
+    svg_inner = "\n  ".join(elems)
+    total_h   = H + 4
+    return (f'<svg viewBox="0 0 {W} {total_h}" xmlns="http://www.w3.org/2000/svg" '
+            f'style="width:100%;max-width:{W}px;height:auto;display:block;">\n'
+            f'  <rect width="{W}" height="{total_h}" fill="white" rx="4"/>\n'
+            f'  {svg_inner}\n'
+            f'</svg>')
 
 
 # ── HTML 生成 ─────────────────────────────────────────
@@ -418,89 +515,38 @@ def build_html(regime: dict | None, regime_exp: str,
     # ── 局面分析セクション ──────────────────────────────
     regime_section = ""
     if regime:
+        top1    = regime["top1"]
+        lbl     = f" {top1['label']}" if top1["label"] else ""
+        chip    = (f"<span style='display:inline-block;background:#fff3e0;"
+                   f"border:1px solid #fb8c00;border-radius:12px;padding:3px 12px;"
+                   f"font-size:11px;'>{top1['date']}{lbl} "
+                   f"({top1['similarity']:.1%})</span>")
+
         exp_html = (regime_exp
                     .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-        exp_html = re.sub(r"## (類似局面[①②③\d]+.*?)(\n|$)",
-                          r"<h4 style='color:#b71c1c;font-size:13px;margin:12px 0 3px;'>🕐 \1</h4>",
+        exp_html = re.sub(r"## (類似局面.*?)(\n|$)",
+                          r"<h4 style='color:#b71c1c;font-size:13px;margin:10px 0 2px;'>🕐 \1</h4>",
                           exp_html)
-        exp_html = re.sub(r"## (アウトパフォーム.*?)(\n|$)",
-                          r"<h4 style='color:#1b5e20;font-size:13px;margin:12px 0 3px;'>▲ \1</h4>",
-                          exp_html)
-        exp_html = re.sub(r"## (アンダーパフォーム.*?)(\n|$)",
-                          r"<h4 style='color:#b71c1c;font-size:13px;margin:12px 0 3px;'>▼ \1</h4>",
+        exp_html = re.sub(r"## (今回の示唆.*?)(\n|$)",
+                          r"<h4 style='color:#1565c0;font-size:13px;margin:10px 0 2px;'>💡 \1</h4>",
                           exp_html)
         exp_html = exp_html.replace("\n- ", "<br>&nbsp;• ").replace("\n", "<br>")
-
-        chips = ""
-        for i, p in enumerate(regime["top2"], 1):
-            lbl = f" {p['label']}" if p["label"] else ""
-            chips += (f"<span style='display:inline-block;background:#fff3e0;"
-                      f"border:1px solid #fb8c00;border-radius:12px;padding:3px 10px;"
-                      f"margin:2px;font-size:11px;'>#{i} {p['date']}{lbl} "
-                      f"({p['similarity']:.1%})</span>")
-
-        def fmt_ret(v):
-            if v is None:
-                return "<span style='color:#bbb;'>—</span>"
-            color = "#2e7d32" if v >= 0 else "#c62828"
-            sign  = "+" if v >= 0 else ""
-            return f"<span style='color:{color};font-weight:bold;'>{sign}{v:.1f}%</span>"
-
-        fwd_headers = ""
-        for i, p in enumerate(regime["top2"], 1):
-            num = ["①", "②"][i - 1]
-            lbl_s = f"<br><small style='color:#888;font-weight:normal;'>{p['label'] or ''}</small>" if p["label"] else ""
-            fwd_headers += (f"<th style='padding:5px 8px;font-size:11px;text-align:center;"
-                            f"background:#e8f5e9;'>類似局面{num}<br>"
-                            f"<small style='color:#555;'>{p['date'][:7]}</small>{lbl_s}</th>")
-
-        all_assets = []
-        for p in regime["top2"]:
-            for a in p.get("forward_returns", {}).keys():
-                if a not in all_assets:
-                    all_assets.append(a)
-
-        fwd_rows = ""
-        for idx, asset in enumerate(all_assets):
-            bg = "#fff" if idx % 2 == 0 else "#fafafa"
-            cells = "".join(
-                f"<td style='padding:4px 8px;font-size:12px;text-align:center;'>"
-                f"{fmt_ret(p.get('forward_returns', {}).get(asset))}</td>"
-                for p in regime["top2"]
-            )
-            fwd_rows += (f"<tr style='background:{bg};'>"
-                         f"<td style='padding:4px 8px;font-size:12px;font-weight:bold;'>{asset}</td>"
-                         f"{cells}</tr>")
 
         regime_table = build_regime_table(regime)
 
         regime_section = f"""
   <div style="background:#fff8f8;padding:16px 24px;border:1px solid #e8e8e8;border-top:none;">
     <div style="font-size:15px;font-weight:bold;color:#b71c1c;margin-bottom:10px;">
-      📊 市場レジーム分析（直近{regime['window']}営業日 / {regime['current_date']}基準）
+      📊 市場レジーム分析（直近{regime['window']}営業日 ≈ 3ヶ月 / {regime['current_date']}基準）
     </div>
     <div style="margin-bottom:10px;">
-      <span style="font-size:11px;color:#888;font-weight:bold;">類似局面トップ2：</span><br>
-      {chips}
+      <span style="font-size:11px;color:#888;font-weight:bold;">類似局面：</span>
+      {chip}
     </div>
     {regime_table}
     <div style="background:white;padding:12px;border-radius:6px;font-size:12px;
-                line-height:1.7;border-left:3px solid #ef9a9a;margin-top:12px;margin-bottom:14px;">
+                line-height:1.7;border-left:3px solid #ef9a9a;margin-top:12px;">
       {exp_html}
-    </div>
-    <div style="margin-top:4px;">
-      <span style="font-size:12px;font-weight:bold;color:#555;">
-        📊 類似局面の翌{regime['window']}日リターン実績
-      </span>
-      <table style="width:100%;border-collapse:collapse;margin-top:6px;">
-        <thead>
-          <tr style="background:#f1f8e9;">
-            <th style="padding:5px 8px;font-size:11px;text-align:left;">資産</th>
-            {fwd_headers}
-          </tr>
-        </thead>
-        <tbody>{fwd_rows}</tbody>
-      </table>
     </div>
     <p style="font-size:10px;color:#ccc;margin:10px 0 0;">
       ※ 本分析は過去データに基づく参考情報です。投資判断を保証するものではありません。
@@ -510,7 +556,8 @@ def build_html(regime: dict | None, regime_exp: str,
     # ── パターン分析セクション ──────────────────────────
     pattern_section = ""
     if pattern:
-        chart_b64 = build_pattern_chart(pattern)
+        svg_chart = build_pattern_svg(pattern)
+
         rows = ""
         for i, sim in enumerate(pattern["top_similar"], 1):
             ff      = sim["forward_final"]
@@ -537,9 +584,7 @@ def build_html(regime: dict | None, regime_exp: str,
       📉 日経平均 チャートパターン分析
       （{pattern['current_start']} 〜 {pattern['current_end']}）
     </div>
-    <img src="data:image/jpeg;base64,{chart_b64}"
-         style="width:100%;max-width:640px;border-radius:6px;display:block;"
-         alt="パターン分析チャート">
+    {svg_chart}
     <div style="margin-top:14px;">
       <span style="font-size:12px;font-weight:bold;color:#555;">
         形状類似局面トップ{len(pattern['top_similar'])}
@@ -560,7 +605,7 @@ def build_html(regime: dict | None, regime_exp: str,
       </p>
     </div>
     <p style="font-size:10px;color:#bbb;margin:8px 0 0;">
-      ※ Pearson r で形状類似度を計算。投資判断を保証するものではありません。
+      ※ Pearson r で形状類似度を計算。チャート形状の一致は参考指標です。
     </p>
   </div>"""
 
@@ -572,8 +617,11 @@ def build_html(regime: dict | None, regime_exp: str,
   </div>"""
 
     return f"""<!DOCTYPE html>
-<html lang="ja"><head><meta charset="utf-8"></head>
-<body style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:680px;
+<html lang="ja"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:640px;
              margin:0 auto;color:#333;font-size:14px;">
   <div style="background:#37474f;color:white;padding:16px 24px;border-radius:8px 8px 0 0;">
     <div style="font-size:20px;font-weight:bold;">🔬 マーケット分析レポート</div>
@@ -585,7 +633,7 @@ def build_html(regime: dict | None, regime_exp: str,
   <div style="background:#f5f5f5;padding:10px 24px;border:1px solid #e8e8e8;
               border-top:none;border-radius:0 0 8px 8px;text-align:center;">
     <p style="font-size:10px;color:#bbb;margin:0;">
-      Powered by Groq (Llama 3.3 70B) · FRED
+      Powered by Groq (Llama 3.3 70B) · yfinance
     </p>
   </div>
 </body></html>"""
@@ -593,12 +641,11 @@ def build_html(regime: dict | None, regime_exp: str,
 
 # ── メール送信 ────────────────────────────────────────
 def send_email(subject: str, html_body: str) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = GMAIL_USER
+    msg             = MIMEMultipart("alternative")
+    msg["Subject"]  = subject
+    msg["From"]     = GMAIL_USER
+    msg["To"]       = GMAIL_USER
     msg.attach(MIMEText(html_body, "html", "utf-8"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, GMAIL_USER, msg.as_string())
@@ -626,7 +673,7 @@ def main():
         print("[2/4] 局面分析スキップ")
 
     print("[3/4] チャートパターン分析 (日経平均)...")
-    pattern = run_pattern_analysis(window_days=42, forward_days=21, top_n=5)
+    pattern = run_pattern_analysis(window_days=63, forward_days=21, top_n=5)
 
     print("[4/4] メール送信...")
     html    = build_html(regime, regime_exp, pattern, date_str)
