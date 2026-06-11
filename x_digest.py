@@ -3,23 +3,22 @@
 金融SNSダイジェスト (StockTwits版)
 
 StockTwits の無料 API でトレンドメッセージを取得して表示する。
-認証不要・無料。
+認証不要・無料。GitHub Actions の IP ブロック対策に curl_cffi を使用。
+取得失敗時はニュースに逃がさずエラーを明示する。
 
   📈 注目の投資商品 TOP5
-  🗾 日本で話題 TOP5 (EWJ/NKY メッセージ ＋ RSS補完)
+  🗾 日本関連 TOP5 (EWJ/NKY メッセージ)
   🌍 海外で話題 TOP5
   🔥 総合ランキング TOP10
 """
 
 import os
-import re
 import smtplib
 import time
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import feedparser
 import pytz
 import requests
 
@@ -53,7 +52,7 @@ PRODUCT_KEYWORDS = [
 ]
 
 # 日本関連シンボル（StockTwits）
-JP_SYMBOLS = ["EWJ", "DXJ", "NKY", "DBJP", "HEWJ"]
+JP_SYMBOLS = ["EWJ", "DXJ", "DBJP", "HEWJ"]
 
 # 人気シンボル（グローバル）
 POPULAR_SYMBOLS = [
@@ -61,25 +60,36 @@ POPULAR_SYMBOLS = [
     "SPY", "QQQ", "BTC.X", "ETH.X", "GLD", "TLT", "AMD",
 ]
 
-# 日本語ニュース RSS（StockTwits JP が薄い場合の補完）
-JP_RSS_FEEDS = {
-    "NHK経済":         "https://www.nhk.or.jp/rss/news/cat6.xml",
-    "ロイター(日本語)": "https://jp.reuters.com/rssFeed/businessNews",
-    "株探":             "https://kabutan.jp/rss/news.xml",
-}
 
 
 # ── StockTwits 取得 ───────────────────────────────────────
 
 def _get(url: str, params: dict = None) -> dict | None:
-    """HTTP GET ヘルパー。失敗時は None。"""
+    """HTTP GET ヘルパー。失敗時は None。
+
+    GitHub Actions のデータセンターIPは StockTwits の Cloudflare に
+    403 でブロックされるため、curl_cffi の Chrome 偽装を優先使用する。
+    """
+    # ① curl_cffi（Chrome TLSフィンガープリント偽装）
+    try:
+        from curl_cffi import requests as cf_requests
+        r = cf_requests.get(url, params=params, impersonate="chrome", timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[WARN] curl_cffi {url} → HTTP {r.status_code}")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[WARN] curl_cffi GET {url}: {e}")
+
+    # ② 通常の requests（ローカル実行などIPがブロックされていない環境用）
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=12)
         if r.status_code == 200:
             return r.json()
-        print(f"[WARN] {url} → HTTP {r.status_code}")
+        print(f"[WARN] requests {url} → HTTP {r.status_code}")
     except Exception as e:
-        print(f"[WARN] GET {url}: {e}")
+        print(f"[WARN] requests GET {url}: {e}")
     return None
 
 
@@ -157,39 +167,6 @@ def fetch_stocktwits() -> tuple[list[dict], list[dict]]:
     return global_msgs, jp_msgs
 
 
-# ── 日本語 RSS 補完 ──────────────────────────────────────
-
-def fetch_jp_rss(hours: int = 24) -> list[dict]:
-    """日本語RSSニュースを取得する（JP StockTwits 補完用）"""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-    items  = []
-    for source, url in JP_RSS_FEEDS.items():
-        try:
-            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
-            for e in feed.entries[:10]:
-                pub    = e.get("published_parsed") or e.get("updated_parsed")
-                pub_dt = datetime(*pub[:6], tzinfo=timezone.utc) if pub else None
-                if pub_dt and pub_dt < cutoff:
-                    continue
-                items.append({
-                    "source":  source,
-                    "title":   e.get("title", "").strip(),
-                    "summary": re.sub(r"<[^>]+>", "",
-                               e.get("summary", e.get("description", ""))).strip()[:200],
-                    "link":    e.get("link", ""),
-                    "date":    pub_dt,
-                })
-        except Exception as ex:
-            print(f"[WARN] RSS {source}: {ex}")
-        time.sleep(0.2)
-    items.sort(
-        key=lambda x: x["date"] or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
-    print(f"  RSS JP: {len(items[:10])} 件")
-    return items[:10]
-
-
 # ── HTML パーツ ───────────────────────────────────────────
 
 def _esc(s: str) -> str:
@@ -244,24 +221,6 @@ def st_card(m: dict, rank: int) -> str:
 </div>"""
 
 
-def rss_card(a: dict, rank: int) -> str:
-    date_s = a["date"].strftime("%m/%d %H:%M") if a.get("date") else ""
-    lnk    = (f"<a href='{_esc(a['link'])}' target='_blank' "
-              f"style='font-size:11px;color:#1976d2;text-decoration:none;'>"
-              f"→ 記事を読む ↗</a>") if a.get("link") else ""
-    return f"""
-<div style="border-bottom:1px solid #f0f0f0;padding:10px 0;">
-  <div style="font-size:11px;color:#aaa;margin-bottom:3px;">
-    <span style="background:#fff3e0;color:#e65100;border-radius:3px;
-                 padding:1px 5px;font-size:10px;margin-right:6px;">{_esc(a['source'])}</span>
-    #{rank}&nbsp;{date_s}
-  </div>
-  <div style="font-size:13px;font-weight:bold;line-height:1.5;color:#222;">{_esc(a['title'])}</div>
-  {"<div style='font-size:12px;color:#555;margin-top:2px;'>" + _esc(a.get('summary','')) + "</div>" if a.get('summary') else ""}
-  {lnk}
-</div>"""
-
-
 def section(icon: str, title: str, subtitle: str, cards_html: str,
             title_color: str = "#b71c1c") -> str:
     return (f"<h3 style='color:{title_color};margin:22px 0 2px;font-size:15px;'>"
@@ -281,12 +240,12 @@ def filter_product_msgs(msgs: list[dict], top_n: int = 5) -> list[dict]:
     return matched[:top_n]
 
 
-def build_html(global_msgs: list, jp_msgs: list, jp_rss: list,
+def build_html(global_msgs: list, jp_msgs: list,
                date_str: str, time_label: str,
                since_str: str, now_str: str) -> str:
 
     icon_hdr = "🌅" if "朝" in time_label else "🌆"
-    has_data = bool(global_msgs or jp_msgs or jp_rss)
+    has_data = bool(global_msgs or jp_msgs)
     sections_html = []
 
     if has_data:
@@ -301,19 +260,12 @@ def build_html(global_msgs: list, jp_msgs: list, jp_rss: list,
                 "商品・ティッカー言及メッセージ · エンゲージメント順",
                 cards, "#2e7d32"))
 
-        # 🗾 日本で話題 TOP5
+        # 🗾 日本関連 TOP5（取得できた場合のみ表示）
         if jp_msgs:
             cards = "".join(st_card(m, i) for i, m in enumerate(jp_msgs[:5], 1))
             sections_html.append(section(
-                "🗾", "日本で話題",
+                "🗾", "日本関連",
                 "EWJ/NKY 関連メッセージ · エンゲージメント順",
-                cards, "#c62828"))
-        elif jp_rss:
-            # StockTwits の JP 投稿が少なければ RSS ニュースで補完
-            cards = "".join(rss_card(a, i) for i, a in enumerate(jp_rss[:5], 1))
-            sections_html.append(section(
-                "🗾", "日本で話題",
-                "日本語ニュース（RSS補完）· 新着順",
                 cards, "#c62828"))
 
         # 🌍 海外で話題 TOP5
@@ -410,14 +362,8 @@ def main():
         print("[1/3] StockTwits 取得中...")
         global_msgs, jp_msgs = fetch_stocktwits()
 
-        # JP StockTwits が少なければ RSS 補完
-        jp_rss: list[dict] = []
-        if len(jp_msgs) < 3:
-            print("[1b] 日本語 RSS 補完取得中...")
-            jp_rss = fetch_jp_rss(hours=hours_back)
-
         print("[2/3] HTML 生成中...")
-        html = build_html(global_msgs, jp_msgs, jp_rss,
+        html = build_html(global_msgs, jp_msgs,
                           date_str, time_label, since_str, now_str)
 
         # プレーンテキスト（スパムフィルタ対策）
@@ -431,11 +377,6 @@ def main():
                 plain_lines.append(m["text"][:150])
                 plain_lines.append(
                     f"https://stocktwits.com/{m['username']}/message/{m['id']}")
-                plain_lines.append("")
-        elif jp_rss:
-            for a in jp_rss[:5]:
-                plain_lines.append(f"[{a['source']}] {a['title']}")
-                plain_lines.append(a.get("link", ""))
                 plain_lines.append("")
         else:
             plain_lines.append("データを取得できませんでした。")
