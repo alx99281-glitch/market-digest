@@ -1,0 +1,51 @@
+name: Daily US Stock Analysis
+
+on:
+  schedule:
+    # 22:15 UTC = 06:15 SGT
+    - cron: '15 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: us-stock-analysis
+  cancel-in-progress: true
+
+jobs:
+  send-analysis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Clean stale git state
+        run: |
+          git rebase --abort 2>/dev/null || true
+          git merge --abort 2>/dev/null || true
+          git checkout -f 2>/dev/null || true
+          git clean -ffdx 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          clean: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run US stock analysis
+        env:
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python us_stock_analysis.py
