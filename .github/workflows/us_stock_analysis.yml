@@ -1,22 +1,22 @@
-name: Daily Market News Digest
+name: Daily US Stock Analysis
 
 on:
   schedule:
-    # 21:50 UTC = 05:50 SGT（他ワークフローより先に配信）
-    - cron: '50 21 * * *'
+    # 22:15 UTC = 06:15 SGT
+    - cron: '15 22 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: daily-news
+  group: us-stock-analysis
   cancel-in-progress: true
 
 jobs:
-  send-digest:
+  send-analysis:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -40,16 +40,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Japanese fonts
-        run: sudo apt-get install -y fonts-noto-cjk && fc-cache -fv
-
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run news digest
+      - name: Run US stock analysis
         env:
           GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
           GMAIL_USER:          ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
-          FEEDBACK_FORM_URL:   ${{ secrets.FEEDBACK_FORM_URL }}
-        run: python news_digest.py
+        run: python us_stock_analysis.py

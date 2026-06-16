@@ -2,9 +2,12 @@ name: X Financial Digest
 
 on:
   schedule:
-    - cron: '0 22 * * *'   # 06:00 SGT (朝版)
-    - cron: '0 10 * * *'   # 18:00 SGT (夕版)
+    - cron: '5 22 * * *'   # 06:05 SGT 朝版（正時の混雑を避けてずらす）
+    - cron: '5 10 * * *'   # 18:05 SGT 夕版
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 concurrency:
   group: x-digest-${{ github.event.schedule || github.run_id }}
@@ -22,6 +25,7 @@ jobs:
         run: |
           git rebase --abort 2>/dev/null || true
           git merge --abort 2>/dev/null || true
+          git checkout -f 2>/dev/null || true
           git clean -ffdx 2>/dev/null || true
         continue-on-error: true
 
